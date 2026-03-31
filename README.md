@@ -61,9 +61,14 @@ mem.Write(SensorSchema.Temperature, 25.6);
 ```csharp
 var options = new SharedMemoryBufferOptions
 {
-    Capacity = 1024 * 1024,
-    EnableSimd = true,
-    EnableOrphanLockDetection = true
+    Capacity = 1024 * 1024,       // Buffer size in bytes
+    EnableSimd = true,             // SIMD-optimized copy (default: true)
+    EnableOrphanLockDetection = true, // Detect dead lock holders (default: true)
+    OrphanLockTimeout = TimeSpan.FromSeconds(30), // Timeout-based fallback
+    EnableEvents = false,          // OnDataWritten / OnOrphanLockDetected events
+    EnableChecksumVerification = false, // CRC32 integrity checks
+    Alignment = 64,                // Cache-line alignment (default: 64)
+    FilePath = null                // null = anonymous, or path for persistent file-backed MMF
 };
 
 using var buffer = new HighPerformanceSharedBuffer("MyBuffer", options);
@@ -162,6 +167,26 @@ arr.Fill(42);
 arr.Clear();
 ```
 
+### Orphan Lock Recovery
+
+When a process holding a write lock crashes, other processes would be blocked forever. The library detects this automatically:
+
+1. **Process death detection** — Checks if the lock owner PID is still alive via `Process.GetProcessById()`
+2. **Timeout fallback** — If a lock is held longer than `OrphanLockTimeout` (default: 30s), it's considered orphaned
+3. **Safe CAS release** — Uses compare-and-swap on the owner PID to avoid releasing a valid lock that was acquired by a new process between the check and release
+
+```csharp
+// Automatic: TryAcquireWriteLock checks for orphans on first CAS failure
+buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(5)); // auto-recovers if orphaned
+
+// Manual check
+if (buffer.IsWriteLockOrphaned())
+    buffer.TryForceReleaseWriteLock();
+
+// Event notification
+buffer.OnOrphanLockDetected += (s, e) => Console.WriteLine("Orphan lock recovered");
+```
+
 ## IPC Example
 
 **Process A (Producer):**
@@ -220,7 +245,37 @@ Measured on i7-12700K, DDR5-4800, .NET 8.
 
 ## Thread Safety
 
-Types larger than 8 bytes (`Guid`, `DateTimeOffset`, `decimal`, large structs, arrays, strings) can't be written atomically on x64. `StrictSharedMemory` automatically acquires locks for these types to prevent torn reads/writes. The lock is reentrant, so calling from within an explicit lock won't deadlock.
+Types larger than 8 bytes (`Guid`, `DateTimeOffset`, `decimal`, large structs, arrays, strings) can't be written atomically on x64. `StrictSharedMemory` automatically acquires locks for these types to prevent torn reads/writes.
+
+Locks are **reentrant**: nested `AcquireWriteLock()` / `AcquireReadLock()` calls from the same thread increment a depth counter instead of deadlocking. A read lock acquired inside a write lock is also safe.
+
+```csharp
+using (mem.AcquireWriteLock())
+{
+    // Inner lock is reentrant — no deadlock
+    using (mem.AcquireWriteLock())
+    {
+        mem.Write("Field", value);
+    }
+}
+```
+
+## Schema Compatibility
+
+When opening existing shared memory with a different schema version, use `SchemaCompatibility` to control behavior:
+
+| Mode | Behavior |
+|------|----------|
+| `Strict` | Exact version match required (default) |
+| `Forward` | Allow opening memory written by a **newer** version |
+| `Backward` | Allow opening memory written by an **older** version |
+| `Full` | Allow any version difference |
+
+```csharp
+// Consumer opens v1 memory with v2 schema in backward-compatible mode
+using var mem = new StrictSharedMemory<SchemaV2>(
+    "Sensor", schemaV2, create: false, SchemaCompatibility.Backward);
+```
 
 ## Supported Types
 
@@ -245,23 +300,31 @@ yield return FieldDefinition.Scalar<Status>("Status");
 dotnet test
 ```
 
-266 tests: unit, concurrency, stress, boundary conditions, schema compatibility, IPC, and extreme load scenarios.
+339 tests (92.5% line coverage, 84.5% branch coverage): unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, IPC, and extreme load scenarios.
 
 ## Project Structure
 
 ```text
-SharedMemory/
-├── HighPerformanceSharedBuffer.cs
-├── LockFreeCircularBuffer.cs
-├── MpmcCircularBuffer.cs
-├── StrictSharedMemory.cs
-├── SharedArray.cs
-└── SharedMemoryBufferOptions.cs
+SharedMemory/                          # Core library
+├── ISharedMemoryBuffer.cs             # Core interface + event types
+├── SharedMemoryBufferOptions.cs       # Configuration options
+├── HighPerformanceSharedBuffer.cs     # Raw byte buffer with SIMD & orphan lock detection
+├── LockFreeCircularBuffer.cs          # SPSC queue
+├── MpmcCircularBuffer.cs             # MPMC queue
+├── StrictSharedMemory.cs             # Schema-based typed memory access
+└── SharedArray.cs                     # Generic shared T[] with indexer
 
-SharedMemory.Tests/
-└── *Tests.cs
+SharedMemory.Tests/                    # 339 tests (NUnit)
+├── HighPerformanceSharedBufferTests.cs
+├── LockFreeCircularBufferTests.cs
+├── MpmcCircularBufferTests.cs
+├── StrictSharedMemoryTests.cs
+├── SharedArrayTests.cs
+├── AdvancedTests.cs                   # Concurrency & edge cases
+├── ExtremeStressTests.cs              # Extreme load scenarios
+└── CoverageBoostTests.cs             # Validation, reentrant locks, rare paths
 
-SharedMemory.Benchmark/
+SharedMemory.Benchmark/                # BenchmarkDotNet
 └── *.cs
 ```
 

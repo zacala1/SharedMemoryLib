@@ -97,7 +97,7 @@ namespace SharedMemory
         /// <param name="capacity">Requested capacity (will be rounded up to power of 2)</param>
         /// <param name="create">True to create new, false to open existing</param>
         /// <exception cref="ArgumentException">Thrown when name is empty</exception>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when capacity is invalid</exception>
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when capacity is invalid or total size exceeds int.MaxValue after power-of-2 rounding</exception>
         public LockFreeCircularBuffer(string name, long capacity, bool create = true)
         {
             if (string.IsNullOrWhiteSpace(name))

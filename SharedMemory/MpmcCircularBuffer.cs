@@ -94,6 +94,8 @@ namespace SharedMemory
         /// <param name="slotCount">Number of slots (will be rounded up to power of 2)</param>
         /// <param name="slotSize">Size of each slot in bytes (including header)</param>
         /// <param name="create">True to create new, false to open existing</param>
+        /// <exception cref="ArgumentException">Thrown when name is empty</exception>
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when slotCount/slotSize is invalid or total size exceeds int.MaxValue</exception>
         public MpmcCircularBuffer(string name, int slotCount, int slotSize, bool create = true)
         {
             if (string.IsNullOrWhiteSpace(name))

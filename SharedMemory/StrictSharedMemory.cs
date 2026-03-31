@@ -445,7 +445,12 @@ namespace SharedMemory
 
         /// <summary>
         /// Acquires an exclusive write lock on the entire memory region.
+        /// This lock is reentrant: if the current thread already holds a write lock,
+        /// the depth counter is incremented without acquiring the underlying lock again.
         /// </summary>
+        /// <param name="timeout">Lock acquisition timeout (default: 5 seconds)</param>
+        /// <returns>A disposable lock guard that releases the lock on dispose</returns>
+        /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
         public WriteLock AcquireWriteLock(TimeSpan timeout = default)
         {
             ThrowIfDisposed();
@@ -469,7 +474,12 @@ namespace SharedMemory
 
         /// <summary>
         /// Acquires a shared read lock on the entire memory region.
+        /// This lock is reentrant: if the current thread already holds any lock (read or write),
+        /// the depth counter is incremented without acquiring the underlying lock again.
         /// </summary>
+        /// <param name="timeout">Lock acquisition timeout (default: 5 seconds)</param>
+        /// <returns>A disposable lock guard that releases the lock on dispose</returns>
+        /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
         public ReadLock AcquireReadLock(TimeSpan timeout = default)
         {
             ThrowIfDisposed();
@@ -756,7 +766,8 @@ namespace SharedMemory
         }
 
         /// <summary>
-        /// RAII wrapper for write lock with double-dispose protection
+        /// RAII wrapper for write lock with double-dispose and reentrant safety.
+        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
         /// </summary>
         public struct WriteLock : IDisposable
         {
@@ -785,7 +796,8 @@ namespace SharedMemory
         }
 
         /// <summary>
-        /// RAII wrapper for read lock with double-dispose protection
+        /// RAII wrapper for read lock with double-dispose and reentrant safety.
+        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
         /// </summary>
         public struct ReadLock : IDisposable
         {

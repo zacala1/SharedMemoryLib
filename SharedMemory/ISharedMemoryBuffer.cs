@@ -109,18 +109,24 @@ namespace SharedMemory
         int Read(Span<byte> destination, long offset);
 
         /// <summary>
-        /// Asynchronously writes data with cancellation support
+        /// Writes data with cancellation support.
+        /// Note: This executes synchronously — memory-mapped I/O is inherently synchronous.
+        /// The async signature exists for API compatibility with async pipelines.
         /// </summary>
         ValueTask<int> WriteAsync(ReadOnlyMemory<byte> source, long offset, CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Asynchronously reads data with cancellation support
+        /// Reads data with cancellation support.
+        /// Note: This executes synchronously — memory-mapped I/O is inherently synchronous.
+        /// The async signature exists for API compatibility with async pipelines.
         /// </summary>
         ValueTask<int> ReadAsync(Memory<byte> destination, long offset, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Gets a memory view of the buffer region for zero-copy access.
-        /// UNSAFE: Caller must ensure thread safety and lifetime management.
+        /// WARNING: The returned Memory is backed by an unmanaged pointer. The caller must ensure:
+        /// (1) The buffer is not disposed while the Memory is in use.
+        /// (2) Thread safety for concurrent access to the same region.
         /// </summary>
         Memory<byte> GetMemory(long offset, int length);
 
