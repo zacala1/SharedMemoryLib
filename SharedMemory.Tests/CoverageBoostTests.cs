@@ -933,7 +933,309 @@ public class CoverageBoostTests
 
     #endregion
 
+    #region Blob Field Tests
+
+    [Test]
+    public void WriteBlob_ReadBlob_ShouldRoundTrip()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_Blob", schema);
+
+        var data = new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03 };
+        memory.WriteBlob(BlobSchema.DataField, data);
+        var result = memory.ReadBlob(BlobSchema.DataField);
+
+        Assert.That(result, Is.EqualTo(data));
+    }
+
+    [Test]
+    public void WriteBlob_EmptyData_ShouldReturnEmpty()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobEmpty", schema);
+
+        memory.WriteBlob(BlobSchema.DataField, ReadOnlySpan<byte>.Empty);
+        var result = memory.ReadBlob(BlobSchema.DataField);
+
+        Assert.That(result, Is.Empty);
+    }
+
+    [Test]
+    public void WriteBlob_MaxCapacity_ShouldWork()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobMax", schema);
+
+        var data = new byte[256]; // BlobSchema maxSize = 256
+        Random.Shared.NextBytes(data);
+        memory.WriteBlob(BlobSchema.DataField, data);
+        var result = memory.ReadBlob(BlobSchema.DataField);
+
+        Assert.That(result, Is.EqualTo(data));
+    }
+
+    [Test]
+    public void WriteBlob_ExceedsCapacity_ShouldThrow()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobOverflow", schema);
+
+        var data = new byte[300]; // > 256
+        Assert.Throws<ArgumentException>(() => memory.WriteBlob(BlobSchema.DataField, data));
+    }
+
+    [Test]
+    public void WriteBlob_OnNonBlobField_ShouldThrow()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobWrongField", schema);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.WriteBlob(BlobSchema.IntField, new byte[5]));
+    }
+
+    [Test]
+    public void ReadBlob_OnNonBlobField_ShouldThrow()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_ReadBlobWrong", schema);
+
+        Assert.Throws<InvalidOperationException>(() => memory.ReadBlob(BlobSchema.IntField));
+    }
+
+    [Test]
+    public void WriteBlob_Overwrite_ShouldClearStaleData()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobOverwrite", schema);
+
+        // Write large data first
+        var large = new byte[200];
+        Array.Fill(large, (byte)0xFF);
+        memory.WriteBlob(BlobSchema.DataField, large);
+
+        // Overwrite with small data
+        var small = new byte[] { 1, 2, 3 };
+        memory.WriteBlob(BlobSchema.DataField, small);
+
+        // Should only return the small data
+        var result = memory.ReadBlob(BlobSchema.DataField);
+        Assert.That(result, Is.EqualTo(small));
+    }
+
+    [Test]
+    public void ReadBlob_BeforeWrite_ShouldReturnEmpty()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovBoost_BlobNoWrite", schema);
+
+        var result = memory.ReadBlob(BlobSchema.DataField);
+        Assert.That(result, Is.Empty);
+    }
+
+    [Test]
+    public void FieldDefinition_Blob_ZeroSize_ShouldThrow()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => FieldDefinition.Blob("test", 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => FieldDefinition.Blob("test", -1));
+    }
+
+    #endregion
+
+    #region UTF-8 String Tests
+
+    [Test]
+    public void WriteUtf8_ReadUtf8_ASCII_ShouldRoundTrip()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8Ascii", schema);
+
+        memory.WriteUtf8String(Utf8Schema.NameField, "Hello World");
+        var result = memory.ReadUtf8String(Utf8Schema.NameField);
+
+        Assert.That(result, Is.EqualTo("Hello World"));
+    }
+
+    [Test]
+    public void WriteUtf8_ReadUtf8_Unicode_ShouldRoundTrip()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8Unicode", schema);
+
+        memory.WriteUtf8String(Utf8Schema.NameField, "한국어 테스트 🚀");
+        var result = memory.ReadUtf8String(Utf8Schema.NameField);
+
+        Assert.That(result, Is.EqualTo("한국어 테스트 🚀"));
+    }
+
+    [Test]
+    public void WriteUtf8_EmptyString_ShouldReturnEmpty()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8Empty", schema);
+
+        memory.WriteUtf8String(Utf8Schema.NameField, "");
+        var result = memory.ReadUtf8String(Utf8Schema.NameField);
+
+        Assert.That(result, Is.EqualTo(""));
+    }
+
+    [Test]
+    public void WriteUtf8_Null_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8Null", schema);
+
+        Assert.Throws<ArgumentNullException>(() =>
+            memory.WriteUtf8String(Utf8Schema.NameField, null!));
+    }
+
+    [Test]
+    public void WriteUtf8_ExceedsCapacity_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8Overflow", schema);
+
+        // 256 byte max, each Korean char is 3 bytes in UTF-8
+        var longString = new string('가', 100); // 300 bytes > 256
+        Assert.Throws<ArgumentException>(() =>
+            memory.WriteUtf8String(Utf8Schema.NameField, longString));
+    }
+
+    [Test]
+    public void WriteUtf8_OnNonUtf8Field_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8WrongField", schema);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.WriteUtf8String(Utf8Schema.IntField, "test"));
+    }
+
+    [Test]
+    public void ReadUtf8_OnNonUtf8Field_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_ReadUtf8Wrong", schema);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.ReadUtf8String(Utf8Schema.IntField));
+    }
+
+    [Test]
+    public void ReadUtf8_BeforeWrite_ShouldReturnEmpty()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovBoost_Utf8NoWrite", schema);
+
+        var result = memory.ReadUtf8String(Utf8Schema.NameField);
+        Assert.That(result, Is.EqualTo(""));
+    }
+
+    [Test]
+    public void WriteUtf8_LargeString_ShouldUseArrayPoolPath()
+    {
+        var schema = new LargeUtf8Schema();
+        using var memory = new StrictSharedMemory<LargeUtf8Schema>("CovBoost_Utf8Large", schema);
+
+        // 800 ASCII chars = 800 bytes, field is 2048 bytes max
+        var largeString = new string('X', 800);
+        memory.WriteUtf8String(LargeUtf8Schema.BigField, largeString);
+        var result = memory.ReadUtf8String(LargeUtf8Schema.BigField);
+
+        Assert.That(result, Is.EqualTo(largeString));
+    }
+
+    [Test]
+    public void WriteUtf8_LargeUnicode_ShouldUseArrayPoolPath()
+    {
+        var schema = new LargeUtf8Schema();
+        using var memory = new StrictSharedMemory<LargeUtf8Schema>("CovBoost_Utf8LargeUni", schema);
+
+        // 400 Korean chars = 1200 bytes > MaxStackAllocBytes (1024), field is 2048 max
+        var largeString = new string('가', 400);
+        memory.WriteUtf8String(LargeUtf8Schema.BigField, largeString);
+        var result = memory.ReadUtf8String(LargeUtf8Schema.BigField);
+
+        Assert.That(result, Is.EqualTo(largeString));
+    }
+
+    [Test]
+    public void Utf8_MemoryEfficiency_ComparedToUtf16()
+    {
+        // Demonstrate that UTF-8 uses less memory for ASCII
+        var schema = new MixedStringSchema();
+        using var memory = new StrictSharedMemory<MixedStringSchema>("CovBoost_Utf8Efficiency", schema);
+
+        string asciiText = "Hello World 123";
+
+        // UTF-16: 15 chars * 2 bytes = 30 bytes
+        memory.WriteString(MixedStringSchema.Utf16Field, asciiText);
+
+        // UTF-8: 15 chars * 1 byte = 15 bytes (50% less)
+        memory.WriteUtf8String(MixedStringSchema.Utf8Field, asciiText);
+
+        Assert.That(memory.ReadString(MixedStringSchema.Utf16Field), Is.EqualTo(asciiText));
+        Assert.That(memory.ReadUtf8String(MixedStringSchema.Utf8Field), Is.EqualTo(asciiText));
+    }
+
+    [Test]
+    public void FieldDefinition_Utf8String_ZeroSize_ShouldThrow()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => FieldDefinition.Utf8String("test", 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => FieldDefinition.Utf8String("test", -1));
+    }
+
+    #endregion
+
     #region Helper Schemas
+
+    public struct BlobSchema : ISharedMemorySchema
+    {
+        public const string DataField = "Data";
+        public const string IntField = "IntValue";
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Blob(DataField, 256);
+            yield return FieldDefinition.Scalar<int>(IntField);
+        }
+    }
+
+    public struct Utf8Schema : ISharedMemorySchema
+    {
+        public const string NameField = "Name";
+        public const string IntField = "IntValue";
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Utf8String(NameField, 256);
+            yield return FieldDefinition.Scalar<int>(IntField);
+        }
+    }
+
+    public struct LargeUtf8Schema : ISharedMemorySchema
+    {
+        public const string BigField = "BigUtf8";
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            // 2048 bytes max — triggers ArrayPool path for large strings
+            yield return FieldDefinition.Utf8String(BigField, 2048);
+        }
+    }
+
+    public struct MixedStringSchema : ISharedMemorySchema
+    {
+        public const string Utf16Field = "Utf16Name";
+        public const string Utf8Field = "Utf8Name";
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.String(Utf16Field, 64);
+            yield return FieldDefinition.Utf8String(Utf8Field, 128);
+        }
+    }
 
     public struct ReentrantTestSchema : ISharedMemorySchema
     {

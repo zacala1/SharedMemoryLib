@@ -50,7 +50,11 @@ namespace SharedMemory
         /// <summary>DateTimeOffset type (16 bytes)</summary>
         DateTimeOffset,
         /// <summary>Custom unmanaged struct</summary>
-        Struct
+        Struct,
+        /// <summary>Fixed-size binary blob with 4-byte length prefix</summary>
+        Blob,
+        /// <summary>UTF-8 encoded string with 4-byte length prefix</summary>
+        Utf8String
     }
 
     /// <summary>
@@ -444,6 +448,263 @@ namespace SharedMemory
         }
 
         /// <summary>
+        /// Writes binary data to a fixed-size blob field.
+        /// Layout: [4-byte int32 length] + [data bytes]. Automatic locking is applied.
+        /// </summary>
+        /// <param name="fieldName">Name of the blob field</param>
+        /// <param name="data">Data to write</param>
+        /// <exception cref="ArgumentException">Thrown when field not found or data exceeds capacity</exception>
+        /// <exception cref="InvalidOperationException">Thrown when field is not a blob</exception>
+        public void WriteBlob(string fieldName, ReadOnlySpan<byte> data)
+        {
+            ThrowIfDisposed();
+
+            if (!_fields.TryGetValue(fieldName, out var metadata))
+                throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
+
+            if (!metadata.IsBlob)
+                throw new InvalidOperationException($"Field '{fieldName}' is not a blob");
+
+            int maxDataSize = metadata.ArrayLength - 4; // subtract length prefix
+            if (data.Length > maxDataSize)
+                throw new ArgumentException(
+                    $"Data length {data.Length} exceeds blob capacity {maxDataSize}",
+                    nameof(data));
+
+            bool needsAutoLock = !IsHoldingAnyLock();
+            if (needsAutoLock)
+            {
+                using var _ = AcquireWriteLock();
+                WriteBlobInternal(data, metadata);
+            }
+            else
+            {
+                WriteBlobInternal(data, metadata);
+            }
+        }
+
+        private void WriteBlobInternal(ReadOnlySpan<byte> data, FieldMetadata metadata)
+        {
+            long baseOffset = SchemaHeaderSize + metadata.Offset;
+
+            // Write 4-byte length prefix
+            Span<byte> lengthBuf = stackalloc byte[4];
+            BitConverter.TryWriteBytes(lengthBuf, data.Length);
+            _buffer.Write(lengthBuf, baseOffset);
+
+            // Write data
+            if (data.Length > 0)
+                _buffer.Write(data, baseOffset + 4);
+
+            // Zero remaining space to prevent stale data leaking
+            int remaining = metadata.ArrayLength - 4 - data.Length;
+            if (remaining > 0)
+            {
+                Span<byte> zeros = stackalloc byte[Math.Min(remaining, 256)];
+                zeros.Clear();
+                long offset = baseOffset + 4 + data.Length;
+                int left = remaining;
+                while (left > 0)
+                {
+                    int chunk = Math.Min(zeros.Length, left);
+                    _buffer.Write(zeros.Slice(0, chunk), offset);
+                    offset += chunk;
+                    left -= chunk;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads binary data from a fixed-size blob field.
+        /// Returns only the valid portion (up to the stored length).
+        /// Automatic locking is applied.
+        /// </summary>
+        /// <param name="fieldName">Name of the blob field</param>
+        /// <returns>A new byte array containing the blob data</returns>
+        public byte[] ReadBlob(string fieldName)
+        {
+            ThrowIfDisposed();
+
+            if (!_fields.TryGetValue(fieldName, out var metadata))
+                throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
+
+            if (!metadata.IsBlob)
+                throw new InvalidOperationException($"Field '{fieldName}' is not a blob");
+
+            bool needsAutoLock = !IsHoldingAnyLock();
+            if (needsAutoLock)
+            {
+                using var _ = AcquireReadLock();
+                return ReadBlobInternal(metadata);
+            }
+            else
+            {
+                return ReadBlobInternal(metadata);
+            }
+        }
+
+        private byte[] ReadBlobInternal(FieldMetadata metadata)
+        {
+            long baseOffset = SchemaHeaderSize + metadata.Offset;
+
+            // Read 4-byte length prefix
+            Span<byte> lengthBuf = stackalloc byte[4];
+            _buffer.Read(lengthBuf, baseOffset);
+            int length = BitConverter.ToInt32(lengthBuf);
+
+            int maxDataSize = metadata.ArrayLength - 4;
+            if (length <= 0 || length > maxDataSize)
+                return Array.Empty<byte>();
+
+            var result = new byte[length];
+            _buffer.Read(result, baseOffset + 4);
+            return result;
+        }
+
+        /// <summary>
+        /// Writes a UTF-8 encoded string to a field.
+        /// Layout: [4-byte int32 byte-length] + [UTF-8 bytes]. Automatic locking is applied.
+        /// More memory-efficient than WriteString (UTF-16) for ASCII/Latin text.
+        /// </summary>
+        /// <param name="fieldName">Name of the UTF-8 string field</param>
+        /// <param name="value">String to write</param>
+        /// <exception cref="ArgumentNullException">Thrown when value is null</exception>
+        /// <exception cref="ArgumentException">Thrown when encoded size exceeds capacity</exception>
+        /// <exception cref="InvalidOperationException">Thrown when field is not a UTF-8 string</exception>
+        public void WriteUtf8String(string fieldName, string value)
+        {
+            ThrowIfDisposed();
+
+            if (value == null)
+                throw new ArgumentNullException(nameof(value));
+
+            if (!_fields.TryGetValue(fieldName, out var metadata))
+                throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
+
+            if (!metadata.IsUtf8String)
+                throw new InvalidOperationException($"Field '{fieldName}' is not a UTF-8 string");
+
+            int maxDataSize = metadata.ArrayLength - 4;
+            int byteCount = System.Text.Encoding.UTF8.GetByteCount(value);
+            if (byteCount > maxDataSize)
+                throw new ArgumentException(
+                    $"UTF-8 encoded length {byteCount} exceeds field capacity {maxDataSize}",
+                    nameof(value));
+
+            bool needsAutoLock = !IsHoldingAnyLock();
+            if (needsAutoLock)
+            {
+                using var _ = AcquireWriteLock();
+                WriteUtf8StringInternal(value, byteCount, metadata);
+            }
+            else
+            {
+                WriteUtf8StringInternal(value, byteCount, metadata);
+            }
+        }
+
+        private void WriteUtf8StringInternal(string value, int byteCount, FieldMetadata metadata)
+        {
+            long baseOffset = SchemaHeaderSize + metadata.Offset;
+
+            // Write 4-byte length prefix
+            Span<byte> lengthBuf = stackalloc byte[4];
+            BitConverter.TryWriteBytes(lengthBuf, byteCount);
+            _buffer.Write(lengthBuf, baseOffset);
+
+            if (byteCount > 0)
+            {
+                int totalSize = metadata.ArrayLength - 4;
+                if (totalSize <= MaxStackAllocBytes)
+                {
+                    Span<byte> utf8Buf = stackalloc byte[totalSize];
+                    utf8Buf.Clear();
+                    System.Text.Encoding.UTF8.GetBytes(value, utf8Buf);
+                    _buffer.Write(utf8Buf, baseOffset + 4);
+                }
+                else
+                {
+                    byte[] rented = ArrayPool<byte>.Shared.Rent(totalSize);
+                    try
+                    {
+                        var span = rented.AsSpan(0, totalSize);
+                        span.Clear();
+                        System.Text.Encoding.UTF8.GetBytes(value, span);
+                        _buffer.Write(span, baseOffset + 4);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(rented);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads a UTF-8 encoded string from a field.
+        /// Returns the decoded string based on the stored byte-length prefix.
+        /// Automatic locking is applied.
+        /// </summary>
+        /// <param name="fieldName">Name of the UTF-8 string field</param>
+        /// <returns>The decoded string</returns>
+        public string ReadUtf8String(string fieldName)
+        {
+            ThrowIfDisposed();
+
+            if (!_fields.TryGetValue(fieldName, out var metadata))
+                throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
+
+            if (!metadata.IsUtf8String)
+                throw new InvalidOperationException($"Field '{fieldName}' is not a UTF-8 string");
+
+            bool needsAutoLock = !IsHoldingAnyLock();
+            if (needsAutoLock)
+            {
+                using var _ = AcquireReadLock();
+                return ReadUtf8StringInternal(metadata);
+            }
+            else
+            {
+                return ReadUtf8StringInternal(metadata);
+            }
+        }
+
+        private string ReadUtf8StringInternal(FieldMetadata metadata)
+        {
+            long baseOffset = SchemaHeaderSize + metadata.Offset;
+
+            // Read 4-byte length prefix
+            Span<byte> lengthBuf = stackalloc byte[4];
+            _buffer.Read(lengthBuf, baseOffset);
+            int byteLength = BitConverter.ToInt32(lengthBuf);
+
+            int maxDataSize = metadata.ArrayLength - 4;
+            if (byteLength <= 0 || byteLength > maxDataSize)
+                return string.Empty;
+
+            if (byteLength <= MaxStackAllocBytes)
+            {
+                Span<byte> utf8Buf = stackalloc byte[byteLength];
+                _buffer.Read(utf8Buf, baseOffset + 4);
+                return System.Text.Encoding.UTF8.GetString(utf8Buf);
+            }
+            else
+            {
+                byte[] rented = ArrayPool<byte>.Shared.Rent(byteLength);
+                try
+                {
+                    var span = rented.AsSpan(0, byteLength);
+                    _buffer.Read(span, baseOffset + 4);
+                    return System.Text.Encoding.UTF8.GetString(span);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+        }
+
+        /// <summary>
         /// Acquires an exclusive write lock on the entire memory region.
         /// This lock is reentrant: if the current thread already holds a write lock,
         /// the depth counter is incremented without acquiring the underlying lock again.
@@ -646,8 +907,12 @@ namespace SharedMemory
                     ElementSize = field.ElementSize,
                     ArrayLength = field.ArrayLength,
                     TypeCode = field.TypeCode,
-                    IsArray = field.ArrayLength > 1,
-                    IsString = field.TypeCode == SharedTypeCode.Char && field.ArrayLength > 1
+                    IsArray = field.ArrayLength > 1
+                        && field.TypeCode != SharedTypeCode.Blob
+                        && field.TypeCode != SharedTypeCode.Utf8String,
+                    IsString = field.TypeCode == SharedTypeCode.Char && field.ArrayLength > 1,
+                    IsBlob = field.TypeCode == SharedTypeCode.Blob,
+                    IsUtf8String = field.TypeCode == SharedTypeCode.Utf8String
                 };
 
                 metadata[field.Name] = meta;
@@ -835,6 +1100,8 @@ namespace SharedMemory
             public SharedTypeCode TypeCode { get; set; }
             public bool IsArray { get; set; }
             public bool IsString { get; set; }
+            public bool IsBlob { get; set; }
+            public bool IsUtf8String { get; set; }
         }
     }
 
@@ -1061,6 +1328,54 @@ namespace SharedMemory
                 ElementSize = Unsafe.SizeOf<T>(),
                 ArrayLength = length,
                 Alignment = IntPtr.Size
+            };
+        }
+
+        /// <summary>
+        /// Creates a blob field definition for fixed-size binary data.
+        /// Layout: [4-byte length prefix] + [maxSize bytes of data].
+        /// Total storage = maxSize + 4 bytes.
+        /// </summary>
+        /// <param name="name">Field name</param>
+        /// <param name="maxSize">Maximum data size in bytes (excluding the 4-byte length prefix)</param>
+        /// <returns>Field definition for a blob value</returns>
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when maxSize is not positive</exception>
+        public static FieldDefinition Blob(string name, int maxSize)
+        {
+            if (maxSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxSize));
+
+            return new FieldDefinition
+            {
+                Name = name,
+                TypeCode = SharedTypeCode.Blob,
+                ElementSize = 1,
+                ArrayLength = maxSize + 4, // 4-byte length prefix + data
+                Alignment = 4
+            };
+        }
+
+        /// <summary>
+        /// Creates a UTF-8 string field definition.
+        /// Layout: [4-byte byte-length prefix] + [maxByteLength bytes of UTF-8 data].
+        /// Total storage = maxByteLength + 4 bytes.
+        /// </summary>
+        /// <param name="name">Field name</param>
+        /// <param name="maxByteLength">Maximum UTF-8 encoded size in bytes (excluding the 4-byte length prefix)</param>
+        /// <returns>Field definition for a UTF-8 string value</returns>
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when maxByteLength is not positive</exception>
+        public static FieldDefinition Utf8String(string name, int maxByteLength)
+        {
+            if (maxByteLength <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxByteLength));
+
+            return new FieldDefinition
+            {
+                Name = name,
+                TypeCode = SharedTypeCode.Utf8String,
+                ElementSize = 1,
+                ArrayLength = maxByteLength + 4, // 4-byte length prefix + data
+                Alignment = 4
             };
         }
     }

@@ -12,6 +12,7 @@ Windows named shared memory is fast, but the raw API is tedious. This library wr
 - **Lock-free SPSC/MPMC** — Circular buffers with cache-line padding
 - **Zero-allocation** — `Span<T>`, `stackalloc`, no GC pressure
 - **Schema Versioning** — Type-safe fields with compatibility modes
+- **Blob & UTF-8** — Binary data and UTF-8 strings with length prefix
 - **Orphan Lock Recovery** — Handles process crashes gracefully
 - **CRC32 Checksum** — Hardware-accelerated integrity verification
 
@@ -283,6 +284,10 @@ using var mem = new StrictSharedMemory<SchemaV2>(
 
 **Extended:** `Guid`, `DateTime`, `TimeSpan`, `DateTimeOffset`, custom `unmanaged` structs, enums
 
+**Strings:** UTF-16 (`FieldDefinition.String`) and UTF-8 (`FieldDefinition.Utf8String`)
+
+**Binary:** Fixed-size blob (`FieldDefinition.Blob`) with length prefix
+
 ```csharp
 // Custom struct
 public struct Vector3 { public float X, Y, Z; }
@@ -292,6 +297,39 @@ yield return FieldDefinition.StructArray<Vector3>("Waypoints", 10);
 // Enum (stored as underlying type)
 public enum Status : int { Active = 1, Paused = 2 }
 yield return FieldDefinition.Scalar<Status>("Status");
+
+// UTF-8 string (more compact for ASCII/Latin text)
+yield return FieldDefinition.Utf8String("DeviceName", maxByteLength: 128);
+
+// Binary blob (images, serialized data, etc.)
+yield return FieldDefinition.Blob("Thumbnail", maxSize: 4096);
+```
+
+### Blob and UTF-8 String Fields
+
+Blob and UTF-8 fields use a 4-byte length prefix so actual data size is tracked:
+
+```csharp
+// Schema definition
+public struct DataSchema : ISharedMemorySchema
+{
+    public IEnumerable<FieldDefinition> GetFields()
+    {
+        yield return FieldDefinition.Blob("Payload", maxSize: 1024);      // up to 1KB binary
+        yield return FieldDefinition.Utf8String("Message", maxByteLength: 256); // up to 256 bytes UTF-8
+    }
+}
+
+// Usage
+using var mem = new StrictSharedMemory<DataSchema>("Data", new DataSchema());
+
+// Blob: write/read raw bytes
+mem.WriteBlob("Payload", new byte[] { 0xDE, 0xAD, 0xBE, 0xEF });
+byte[] payload = mem.ReadBlob("Payload"); // returns exactly [0xDE, 0xAD, 0xBE, 0xEF]
+
+// UTF-8: efficient for ASCII, full Unicode support
+mem.WriteUtf8String("Message", "Hello 한국어 🚀");
+string msg = mem.ReadUtf8String("Message");
 ```
 
 ## Testing
@@ -300,7 +338,7 @@ yield return FieldDefinition.Scalar<Status>("Status");
 dotnet test
 ```
 
-339 tests (92.5% line coverage, 84.5% branch coverage): unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, IPC, and extreme load scenarios.
+360 tests: unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, blob/UTF-8 fields, IPC, and extreme load scenarios.
 
 ## Project Structure
 
