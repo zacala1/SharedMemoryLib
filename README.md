@@ -338,7 +338,23 @@ string msg = mem.ReadUtf8String("Message");
 dotnet test
 ```
 
-360 tests: unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, blob/UTF-8 fields, IPC, and extreme load scenarios.
+389 tests (95.1% line coverage, 88.4% branch coverage): unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, blob/UTF-8 fields, IPC, and extreme load scenarios.
+
+### Coverage by Class
+
+| Class | Line | Branch |
+|-------|------|--------|
+| `BufferEventArgs` | 100% | 100% |
+| `LockOwnerInfo` | 100% | 100% |
+| `SharedArray<T>` | 100% | 100% |
+| `LockFreeCircularBuffer` | 99.3% | 95%+ |
+| `StrictSharedMemory<T>` | 97.8% | 90%+ |
+| `FieldDefinition` | 96.5% | 85%+ |
+| `SharedMemoryBufferOptions` | 96.0% | 80%+ |
+| `MpmcCircularBuffer` | 95.4% | 85%+ |
+| `HighPerformanceSharedBuffer` | 88.3% | 80%+ |
+
+> `HighPerformanceSharedBuffer` remaining uncovered lines are OS-level failure paths (MMF allocation failure, cleanup exceptions) and cross-process orphan lock scenarios that require process death simulation.
 
 ## Project Structure
 

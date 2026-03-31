@@ -1279,4 +1279,378 @@ public class CoverageBoostTests
     }
 
     #endregion
+
+    #region Additional Coverage Boost — Round 2
+
+    // --- HighPerformanceSharedBuffer ---
+
+    [Test]
+    public void GetStatistics_ShouldTrackReadWriteCounts()
+    {
+        var options = new SharedMemoryBufferOptions { Capacity = 4096 };
+        using var buffer = new HighPerformanceSharedBuffer("CovR2_Stats", options);
+
+        buffer.Write(new byte[] { 1, 2, 3 }, 0);
+        buffer.Write(new byte[] { 4, 5 }, 10);
+        buffer.Read(new byte[3], 0);
+
+        var stats = buffer.GetStatistics();
+        Assert.That(stats.Writes, Is.EqualTo(2));
+        Assert.That(stats.Reads, Is.EqualTo(1));
+        Assert.That(stats.BytesWritten, Is.EqualTo(5));
+        Assert.That(stats.BytesRead, Is.EqualTo(3));
+    }
+
+    [Test]
+    public void ReadLock_Timeout_DueToWriterContention_ShouldReturnFalse()
+    {
+        var options = new SharedMemoryBufferOptions { Capacity = 4096 };
+        using var buffer = new HighPerformanceSharedBuffer("CovR2_RLockTO", options);
+
+        var lockHeld = new ManualResetEventSlim(false);
+        var release = new ManualResetEventSlim(false);
+
+        var task = Task.Run(() =>
+        {
+            buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(5));
+            lockHeld.Set();
+            release.Wait();
+            buffer.ReleaseWriteLock();
+        });
+
+        lockHeld.Wait();
+        // ReadLock should fail because write lock is held
+        var result = buffer.TryAcquireReadLock(TimeSpan.FromMilliseconds(50));
+        Assert.That(result, Is.False);
+
+        release.Set();
+        task.Wait();
+    }
+
+    [Test]
+    public void OrphanLock_TimeoutBased_ShouldDetect()
+    {
+        var options = new SharedMemoryBufferOptions
+        {
+            Capacity = 4096,
+            EnableOrphanLockDetection = true,
+            OrphanLockTimeout = TimeSpan.FromMilliseconds(50) // very short
+        };
+        using var buffer = new HighPerformanceSharedBuffer("CovR2_OrphanTO", options);
+
+        buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1));
+        // Don't release — wait for timeout
+        Thread.Sleep(100);
+
+        // Timeout-based detection should fire
+        Assert.That(buffer.IsWriteLockOrphaned(), Is.True);
+
+        buffer.ReleaseWriteLock();
+    }
+
+    // --- MpmcCircularBuffer ---
+
+    [Test]
+    public void Mpmc_OpenExisting_ShouldValidate()
+    {
+        // Create first
+        using var buf1 = new MpmcCircularBuffer("CovR2_MpmcOpen", 4, 64, create: true);
+
+        // Open existing with same params
+        using var buf2 = new MpmcCircularBuffer("CovR2_MpmcOpen", 4, 64, create: false);
+
+        // Should work without exception
+        Assert.That(buf2.SlotCount, Is.EqualTo(buf1.SlotCount));
+    }
+
+    [Test]
+    public void Mpmc_OpenExisting_SlotCountMismatch_ShouldThrow()
+    {
+        using var buf1 = new MpmcCircularBuffer("CovR2_MpmcMismatch", 4, 64, create: true);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            new MpmcCircularBuffer("CovR2_MpmcMismatch", 8, 64, create: false));
+    }
+
+    [Test]
+    public void Mpmc_OpenExisting_SlotSizeMismatch_ShouldThrow()
+    {
+        using var buf1 = new MpmcCircularBuffer("CovR2_MpmcSizeMismatch", 4, 64, create: true);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            new MpmcCircularBuffer("CovR2_MpmcSizeMismatch", 4, 128, create: false));
+    }
+
+    [Test]
+    public void Mpmc_TryRead_SmallDestination_ShouldTruncate()
+    {
+        using var buffer = new MpmcCircularBuffer("CovR2_MpmcTrunc", 4, 64);
+
+        var data = new byte[40];
+        Array.Fill(data, (byte)0xAB);
+        buffer.TryWrite(data);
+
+        // Read into smaller buffer — should truncate
+        var small = new byte[10];
+        int read = buffer.TryRead(small);
+        Assert.That(read, Is.EqualTo(10));
+        Assert.That(small[0], Is.EqualTo(0xAB));
+    }
+
+    [Test]
+    public void Mpmc_SpinExhaustion_Write_ShouldReturnFalse()
+    {
+        // 2 slots, fill both, then TryWrite should spin-exhaust on a 3rd
+        using var buffer = new MpmcCircularBuffer("CovR2_MpmcSpinW", 2, 32);
+
+        var data = new byte[16]; // MaxMessageSize = 32 - 16 = 16
+        Assert.That(buffer.TryWrite(data), Is.True);
+        Assert.That(buffer.TryWrite(data), Is.True);
+
+        // Buffer full — TryWrite will spin then fail
+        Assert.That(buffer.TryWrite(data), Is.False);
+    }
+
+    [Test]
+    public void Mpmc_SpinExhaustion_Read_ShouldReturnZero()
+    {
+        // Empty buffer — TryRead will spin then fail
+        using var buffer = new MpmcCircularBuffer("CovR2_MpmcSpinR", 2, 32);
+
+        var dest = new byte[16];
+        Assert.That(buffer.TryRead(dest), Is.EqualTo(0));
+    }
+
+    // --- LockFreeCircularBuffer ---
+
+    [Test]
+    public void LockFree_Clear_ShouldResetPositions()
+    {
+        using var buffer = new LockFreeCircularBuffer("CovR2_Clear", 4096);
+
+        buffer.TryWrite(new byte[] { 1, 2, 3, 4 });
+        Assert.That(buffer.Used, Is.GreaterThan(0));
+
+        buffer.Clear();
+        Assert.That(buffer.Used, Is.EqualTo(0));
+        Assert.That(buffer.Available, Is.EqualTo(buffer.Capacity));
+    }
+
+    [Test]
+    public void LockFree_TryWrite_EmptyData_ShouldSucceed()
+    {
+        using var buffer = new LockFreeCircularBuffer("CovR2_EmptyWrite", 4096);
+
+        Assert.That(buffer.TryWrite(ReadOnlySpan<byte>.Empty), Is.True);
+        Assert.That(buffer.Used, Is.EqualTo(0));
+    }
+
+    [Test]
+    public void LockFree_TryRead_EmptyDestination_ShouldReturnZero()
+    {
+        using var buffer = new LockFreeCircularBuffer("CovR2_EmptyRead", 4096);
+
+        buffer.TryWrite(new byte[] { 1, 2, 3 });
+        Assert.That(buffer.TryRead(Span<byte>.Empty), Is.EqualTo(0));
+    }
+
+    [Test]
+    public void LockFree_WaitWrite_ShouldSucceedWhenSpaceAvailable()
+    {
+        using var buffer = new LockFreeCircularBuffer("CovR2_WaitWriteOK", 4096);
+
+        var data = new byte[] { 1, 2, 3, 4, 5 };
+        Assert.That(buffer.WaitWrite(data, TimeSpan.FromSeconds(1)), Is.True);
+
+        var read = new byte[5];
+        Assert.That(buffer.WaitRead(read, TimeSpan.FromSeconds(1)), Is.EqualTo(5));
+        Assert.That(read, Is.EqualTo(data));
+    }
+
+    // --- SharedArray large fill ---
+
+    [Test]
+    public void SharedArray_Fill_Large_ShouldUseBatchPath()
+    {
+        // Use a large struct to trigger batchBytes > 1024 path
+        using var array = new SharedArray<long>("CovR2_LargeFill", 5000);
+
+        array.Fill(42L);
+        Assert.That(array[0], Is.EqualTo(42L));
+        Assert.That(array[2500], Is.EqualTo(42L));
+        Assert.That(array[4999], Is.EqualTo(42L));
+    }
+
+    // --- StrictSharedMemory additional ---
+
+    [Test]
+    public void Schema_Property_ShouldReturnSchema()
+    {
+        var schema = new ReentrantTestSchema();
+        using var memory = new StrictSharedMemory<ReentrantTestSchema>("CovR2_SchemaProp", schema);
+
+        Assert.That(memory.Schema, Is.EqualTo(schema));
+        Assert.That(memory.SchemaVersion, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void WriteArray_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new ArraySchema();
+        using var memory = new StrictSharedMemory<ArraySchema>("CovR2_ArrInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.WriteArray<int>("NonExistent", new int[5]));
+    }
+
+    [Test]
+    public void ReadArray_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new ArraySchema();
+        using var memory = new StrictSharedMemory<ArraySchema>("CovR2_ReadArrInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.ReadArray<int>("NonExistent", new int[5]));
+    }
+
+    [Test]
+    public void WriteString_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new ReentrantTestSchema();
+        using var memory = new StrictSharedMemory<ReentrantTestSchema>("CovR2_StrInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.WriteString("NonExistent", "test"));
+    }
+
+    [Test]
+    public void ReadString_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new ReentrantTestSchema();
+        using var memory = new StrictSharedMemory<ReentrantTestSchema>("CovR2_ReadStrInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.ReadString("NonExistent"));
+    }
+
+    [Test]
+    public void WriteBlob_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovR2_BlobInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.WriteBlob("NonExistent", new byte[5]));
+    }
+
+    [Test]
+    public void ReadBlob_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovR2_ReadBlobInvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.ReadBlob("NonExistent"));
+    }
+
+    [Test]
+    public void WriteUtf8_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovR2_Utf8InvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.WriteUtf8String("NonExistent", "test"));
+    }
+
+    [Test]
+    public void ReadUtf8_InvalidFieldName_ShouldThrow()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovR2_ReadUtf8InvalidName", schema);
+
+        Assert.Throws<ArgumentException>(() =>
+            memory.ReadUtf8String("NonExistent"));
+    }
+
+    [Test]
+    public void WriteArray_WrongElementType_ShouldThrow()
+    {
+        var schema = new ArraySchema();
+        using var memory = new StrictSharedMemory<ArraySchema>("CovR2_ArrWrongType", schema);
+
+        // IntArray expects int (4 bytes), not double (8 bytes)
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.WriteArray<double>(ArraySchema.IntArrayField, new double[5]));
+    }
+
+    [Test]
+    public void ReadArray_WrongElementType_ShouldThrow()
+    {
+        var schema = new ArraySchema();
+        using var memory = new StrictSharedMemory<ArraySchema>("CovR2_ReadArrWrongType", schema);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.ReadArray<double>(ArraySchema.IntArrayField, new double[5]));
+    }
+
+    [Test]
+    public void WriteBlob_UnderExplicitLock_ShouldSkipAutoLock()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovR2_BlobLock", schema);
+
+        using (memory.AcquireWriteLock())
+        {
+            memory.WriteBlob(BlobSchema.DataField, new byte[] { 1, 2, 3 });
+        }
+
+        var result = memory.ReadBlob(BlobSchema.DataField);
+        Assert.That(result, Is.EqualTo(new byte[] { 1, 2, 3 }));
+    }
+
+    [Test]
+    public void ReadBlob_UnderExplicitLock_ShouldSkipAutoLock()
+    {
+        var schema = new BlobSchema();
+        using var memory = new StrictSharedMemory<BlobSchema>("CovR2_ReadBlobLock", schema);
+
+        memory.WriteBlob(BlobSchema.DataField, new byte[] { 10, 20 });
+
+        using (memory.AcquireReadLock())
+        {
+            var result = memory.ReadBlob(BlobSchema.DataField);
+            Assert.That(result, Is.EqualTo(new byte[] { 10, 20 }));
+        }
+    }
+
+    [Test]
+    public void WriteUtf8_UnderExplicitLock_ShouldSkipAutoLock()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovR2_Utf8Lock", schema);
+
+        using (memory.AcquireWriteLock())
+        {
+            memory.WriteUtf8String(Utf8Schema.NameField, "Locked");
+        }
+
+        Assert.That(memory.ReadUtf8String(Utf8Schema.NameField), Is.EqualTo("Locked"));
+    }
+
+    [Test]
+    public void ReadUtf8_UnderExplicitLock_ShouldSkipAutoLock()
+    {
+        var schema = new Utf8Schema();
+        using var memory = new StrictSharedMemory<Utf8Schema>("CovR2_ReadUtf8Lock", schema);
+
+        memory.WriteUtf8String(Utf8Schema.NameField, "Test");
+
+        using (memory.AcquireReadLock())
+        {
+            Assert.That(memory.ReadUtf8String(Utf8Schema.NameField), Is.EqualTo("Test"));
+        }
+    }
+
+    #endregion
 }
