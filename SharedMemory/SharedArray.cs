@@ -136,26 +136,22 @@ namespace SharedMemory
             if ((uint)startIndex + (uint)count > (uint)_length)
                 throw new ArgumentOutOfRangeException();
 
-            // For small counts, use simple loop
-            if (count < 64)
+            // Batch fill: create a filled buffer and write in chunks
+            int batchCount = Math.Min(count, 4096);
+            int batchBytes = batchCount * _elementSize;
+
+            // Use stackalloc for small batches, ArrayPool for large
+            if (batchBytes <= 1024)
             {
-                for (int i = 0; i < count; i++)
-                {
-                    this[startIndex + i] = value;
-                }
-                return;
+                Span<T> temp = stackalloc T[batchCount];
+                temp.Fill(value);
+                FillBatched(startIndex, count, temp);
             }
-
-            // For large counts, use batch copy
-            T[] temp = GC.AllocateUninitializedArray<T>(Math.Min(count, 4096));
-            temp.AsSpan().Fill(value);
-
-            int offset = 0;
-            while (offset < count)
+            else
             {
-                int batchSize = Math.Min(temp.Length, count - offset);
-                CopyFrom(startIndex + offset, temp.AsSpan(0, batchSize));
-                offset += batchSize;
+                T[] rented = GC.AllocateUninitializedArray<T>(batchCount);
+                rented.AsSpan(0, batchCount).Fill(value);
+                FillBatched(startIndex, count, rented.AsSpan(0, batchCount));
             }
         }
 
@@ -166,6 +162,17 @@ namespace SharedMemory
         {
             ThrowIfDisposed();
             Fill(default, 0, _length);
+        }
+
+        private void FillBatched(int startIndex, int count, Span<T> batch)
+        {
+            int offset = 0;
+            while (offset < count)
+            {
+                int batchSize = Math.Min(batch.Length, count - offset);
+                CopyFrom(startIndex + offset, batch.Slice(0, batchSize));
+                offset += batchSize;
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

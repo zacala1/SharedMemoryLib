@@ -1,7 +1,6 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
@@ -454,6 +453,13 @@ namespace SharedMemory
             if (timeout == default)
                 timeout = DefaultLockTimeout;
 
+            // Reentrant: if already holding write lock, just increment depth
+            if (_writeLockDepth.Value > 0)
+            {
+                IncrementWriteLockDepth();
+                return new WriteLock(null, DecrementWriteLockDepth);
+            }
+
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");
 
@@ -470,6 +476,13 @@ namespace SharedMemory
 
             if (timeout == default)
                 timeout = DefaultLockTimeout;
+
+            // Reentrant: if already holding any lock, just increment depth
+            if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
+            {
+                IncrementReadLockDepth();
+                return new ReadLock(null, DecrementReadLockDepth);
+            }
 
             if (!_buffer.TryAcquireReadLock(timeout))
                 throw new TimeoutException($"Failed to acquire read lock within {timeout}");
@@ -562,10 +575,14 @@ namespace SharedMemory
 
         private int CalculateSchemaHash()
         {
+            // Sort field names for deterministic hash (replaces LINQ OrderBy)
+            var fieldValues = new List<FieldMetadata>(_fields.Values);
+            fieldValues.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+
             unchecked
             {
                 int hash = 17;
-                foreach (var field in _fields.Values.OrderBy(f => f.Name, StringComparer.Ordinal))
+                foreach (var field in fieldValues)
                 {
                     // Use stable hash instead of GetHashCode() which varies per process in .NET Core
                     hash = hash * 31 + StableStringHash(field.Name);
@@ -635,7 +652,13 @@ namespace SharedMemory
             if (fields.Count == 0)
                 return 64;
 
-            long maxEnd = fields.Values.Max(f => f.Offset + f.Size);
+            long maxEnd = 0;
+            foreach (var field in fields.Values)
+            {
+                long end = field.Offset + field.Size;
+                if (end > maxEnd)
+                    maxEnd = end;
+            }
             return (maxEnd + 63) & ~63L;
         }
 
@@ -738,9 +761,9 @@ namespace SharedMemory
         public struct WriteLock : IDisposable
         {
             private ISharedMemoryBuffer? _buffer;
-            private readonly Action? _onDispose;
+            private Action? _onDispose;
 
-            internal WriteLock(ISharedMemoryBuffer buffer, Action? onDispose = null)
+            internal WriteLock(ISharedMemoryBuffer? buffer, Action? onDispose = null)
             {
                 _buffer = buffer;
                 _onDispose = onDispose;
@@ -751,11 +774,12 @@ namespace SharedMemory
             /// </summary>
             public void Dispose()
             {
-                var buffer = Interlocked.Exchange(ref _buffer, null);
-                if (buffer != null)
+                var onDispose = Interlocked.Exchange(ref _onDispose, null);
+                if (onDispose != null)
                 {
-                    buffer.ReleaseWriteLock();
-                    _onDispose?.Invoke();
+                    _buffer?.ReleaseWriteLock();
+                    _buffer = null;
+                    onDispose.Invoke();
                 }
             }
         }
@@ -766,9 +790,9 @@ namespace SharedMemory
         public struct ReadLock : IDisposable
         {
             private ISharedMemoryBuffer? _buffer;
-            private readonly Action? _onDispose;
+            private Action? _onDispose;
 
-            internal ReadLock(ISharedMemoryBuffer buffer, Action? onDispose = null)
+            internal ReadLock(ISharedMemoryBuffer? buffer, Action? onDispose = null)
             {
                 _buffer = buffer;
                 _onDispose = onDispose;
@@ -779,11 +803,12 @@ namespace SharedMemory
             /// </summary>
             public void Dispose()
             {
-                var buffer = Interlocked.Exchange(ref _buffer, null);
-                if (buffer != null)
+                var onDispose = Interlocked.Exchange(ref _onDispose, null);
+                if (onDispose != null)
                 {
-                    buffer.ReleaseReadLock();
-                    _onDispose?.Invoke();
+                    _buffer?.ReleaseReadLock();
+                    _buffer = null;
+                    onDispose.Invoke();
                 }
             }
         }

@@ -86,7 +86,9 @@ namespace SharedMemory
         /// </summary>
         /// <returns>Tuple containing write/read counts, bytes transferred, and spin counts</returns>
         public (long Writes, long Reads, long BytesWritten, long BytesRead, long Spins) GetStatistics() =>
-            (_totalWrites, _totalReads, _totalBytesWritten, _totalBytesRead, _totalSpins);
+            (Volatile.Read(ref _totalWrites), Volatile.Read(ref _totalReads),
+             Volatile.Read(ref _totalBytesWritten), Volatile.Read(ref _totalBytesRead),
+             Volatile.Read(ref _totalSpins));
 
         /// <summary>
         /// Creates or opens a lock-free SPSC circular buffer.
@@ -100,19 +102,24 @@ namespace SharedMemory
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty", nameof(name));
-            if (capacity <= 0 || capacity > int.MaxValue)
+            if (capacity <= 0)
                 throw new ArgumentOutOfRangeException(nameof(capacity));
 
             // Round up to power of 2 for fast modulo using bitwise AND
             _capacity = RoundUpToPowerOf2(capacity);
             _capacityMask = _capacity - 1;
 
+            // Validate total size fits in int (required by GetMemory)
+            long totalSize = HeaderSize + _capacity;
+            if (totalSize > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(capacity),
+                    $"Total buffer size {totalSize} (capacity {_capacity} + header {HeaderSize}) exceeds int.MaxValue");
+
             var options = new SharedMemoryBufferOptions
             {
                 Capacity = HeaderSize + _capacity,
                 CreateOrOpen = create,
-                EnableSimd = true,
-                UseLockFree = true
+                EnableSimd = true
             };
 
             _buffer = new HighPerformanceSharedBuffer(name, options);
@@ -172,8 +179,9 @@ namespace SharedMemory
             // Volatile.Write has release semantics - ensures data is visible before publishing
             Volatile.Write(ref _header->WritePosition, writePos + data.Length);
 
-            Interlocked.Increment(ref _totalWrites);
-            Interlocked.Add(ref _totalBytesWritten, data.Length);
+            // SPSC: only writer thread updates these — no atomics needed
+            _totalWrites++;
+            _totalBytesWritten += data.Length;
 
             return true;
         }
@@ -218,8 +226,9 @@ namespace SharedMemory
             // Volatile.Write has release semantics - ensures all stores complete before publishing
             Volatile.Write(ref _header->ReadPosition, readPos + bytesToRead);
 
-            Interlocked.Increment(ref _totalReads);
-            Interlocked.Add(ref _totalBytesRead, bytesToRead);
+            // SPSC: only reader thread updates these — no atomics needed
+            _totalReads++;
+            _totalBytesRead += bytesToRead;
 
             return bytesToRead;
         }
@@ -238,7 +247,7 @@ namespace SharedMemory
                     return false;
 
                 spinner.SpinOnce();
-                Interlocked.Increment(ref _totalSpins);
+                _totalSpins++;
             }
 
             return true;
@@ -259,7 +268,7 @@ namespace SharedMemory
                     return 0;
 
                 spinner.SpinOnce();
-                Interlocked.Increment(ref _totalSpins);
+                _totalSpins++;
             }
 
             return bytesRead;
@@ -340,14 +349,8 @@ namespace SharedMemory
         {
             if (value <= 0)
                 return 1;
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            value |= value >> 32;
-            return value + 1;
+            // BitOperations.RoundUpToPowerOf2 uses lzcnt hardware acceleration
+            return (long)System.Numerics.BitOperations.RoundUpToPowerOf2((ulong)value);
         }
     }
 }

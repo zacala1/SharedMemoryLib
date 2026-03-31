@@ -109,6 +109,9 @@ namespace SharedMemory
             _slotMask = _slotCount - 1;
 
             long capacity = HeaderSize + (long)_slotCount * _slotTotalSize;
+            if (capacity > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(slotCount),
+                    $"Total buffer size {capacity} exceeds int.MaxValue");
 
             var options = new SharedMemoryBufferOptions
             {
@@ -400,13 +403,7 @@ namespace SharedMemory
         {
             if (value <= 0)
                 return 1;
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
+            return (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)value);
         }
     }
 }

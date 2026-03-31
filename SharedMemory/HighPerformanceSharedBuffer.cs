@@ -30,10 +30,6 @@ namespace SharedMemory
         private MemoryMappedViewAccessor? _accessor;
         private byte* _basePtr;
 
-        // Lock-free synchronization state
-        private volatile int _writerCount;
-        private volatile int _readerCount;
-
         // Performance counters
         private long _totalReads;
         private long _totalWrites;
@@ -95,7 +91,8 @@ namespace SharedMemory
         /// </summary>
         /// <returns>Tuple containing read/write counts and bytes transferred</returns>
         public (long Reads, long Writes, long BytesRead, long BytesWritten) GetStatistics() =>
-            (_totalReads, _totalWrites, _totalBytesRead, _totalBytesWritten);
+            (Volatile.Read(ref _totalReads), Volatile.Read(ref _totalWrites),
+             Volatile.Read(ref _totalBytesRead), Volatile.Read(ref _totalBytesWritten));
 
         /// <summary>
         /// Creates or opens a high-performance shared memory buffer.
@@ -223,20 +220,26 @@ namespace SharedMemory
                 source.CopyTo(new Span<byte>(destPtr, source.Length));
             }
 
-            Interlocked.Increment(ref _totalWrites);
-            Interlocked.Add(ref _totalBytesWritten, source.Length);
+            // Non-atomic counters: approximate stats, avoids Interlocked overhead on hot path
+            _totalWrites++;
+            _totalBytesWritten += source.Length;
 
             if (_options.EnableEvents)
             {
-                OnDataWritten?.Invoke(this, new BufferEventArgs
+                try
                 {
-                    EventType = BufferEventType.DataWritten,
-                    BytesAffected = source.Length,
-                    Offset = offset
-                });
+                    OnDataWritten?.Invoke(this, new BufferEventArgs
+                    {
+                        EventType = BufferEventType.DataWritten,
+                        BytesAffected = source.Length,
+                        Offset = offset
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Event handler threw an exception during OnDataWritten");
+                }
             }
-
-            _logger?.LogTrace("Written {Bytes} bytes at offset {Offset}", source.Length, offset);
 
             return source.Length;
         }
@@ -282,8 +285,8 @@ namespace SharedMemory
                 new ReadOnlySpan<byte>(srcPtr, destination.Length).CopyTo(destination);
             }
 
-            Interlocked.Increment(ref _totalReads);
-            Interlocked.Add(ref _totalBytesRead, destination.Length);
+            _totalReads++;
+            _totalBytesRead += destination.Length;
 
             return destination.Length;
         }
@@ -395,7 +398,6 @@ namespace SharedMemory
                             readerSpinner.SpinOnce();
                         }
 
-                        Interlocked.Increment(ref _writerCount);
                         _logger?.LogTrace("Write lock acquired by process {ProcessId}", Environment.ProcessId);
                         success = true;
                         return true;
@@ -448,7 +450,6 @@ namespace SharedMemory
 
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
-            Interlocked.Decrement(ref _writerCount);
 
             _logger?.LogTrace("Write lock released");
         }
@@ -481,9 +482,7 @@ namespace SharedMemory
                     // CAS succeeded - verify no writer came in
                     if (Volatile.Read(ref header->WriterLockState) == 0)
                     {
-                        // Success: update local counter only after confirmed success
-                        Interlocked.Increment(ref _readerCount);
-                        return true;
+                            return true;
                     }
 
                     // Writer acquired lock while we were incrementing - rollback shared counter
@@ -505,7 +504,6 @@ namespace SharedMemory
 
             var header = (SharedHeader*)_basePtr;
             Interlocked.Decrement(ref header->ReaderCount);
-            Interlocked.Decrement(ref _readerCount);
         }
 
         /// <inheritdoc/>
@@ -566,24 +564,39 @@ namespace SharedMemory
         {
             ThrowIfDisposed();
 
+            var header = (SharedHeader*)_basePtr;
+
+            // Snapshot the owner PID before orphan check to prevent TOCTOU race
+            int orphanPid = Volatile.Read(ref header->LockOwnerProcessId);
+            if (orphanPid == 0)
+                return false;
+
             if (!IsWriteLockOrphaned())
                 return false;
 
-            var header = (SharedHeader*)_basePtr;
+            // Verify the same process still holds the lock (prevent releasing a valid lock
+            // that was acquired by a different process between our check and this point)
+            if (Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, orphanPid) != orphanPid)
+                return false; // Lock owner changed, another process took it — do not release
 
-            _logger?.LogWarning("Force releasing orphan lock from process {ProcessId}",
-                header->LockOwnerProcessId);
+            _logger?.LogWarning("Force releasing orphan lock from process {ProcessId}", orphanPid);
 
-            header->LockOwnerProcessId = 0;
             header->LockOwnerThreadId = 0;
             header->LockAcquiredTimestamp = 0;
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
 
-            OnOrphanLockDetected?.Invoke(this, new BufferEventArgs
+            try
             {
-                EventType = BufferEventType.OrphanLockDetected
-            });
+                OnOrphanLockDetected?.Invoke(this, new BufferEventArgs
+                {
+                    EventType = BufferEventType.OrphanLockDetected
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
+            }
 
             return true;
         }

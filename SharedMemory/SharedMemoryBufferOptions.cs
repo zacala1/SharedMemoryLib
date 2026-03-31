@@ -35,11 +35,6 @@ namespace SharedMemory
         public TimeSpan LockTimeout { get; set; } = DefaultLockTimeout;
 
         /// <summary>
-        /// Gets or sets whether to use lock-free synchronization (experimental)
-        /// </summary>
-        public bool UseLockFree { get; set; } = false;
-
-        /// <summary>
         /// Gets or sets whether to enable SIMD optimizations
         /// </summary>
         public bool EnableSimd { get; set; } = true;
