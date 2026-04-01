@@ -139,15 +139,20 @@ byte[] data = new byte[4];
 if (buffer.TryRead(data) > 0)
     Console.WriteLine(BitConverter.ToInt32(data));
 
-// Blocking
+// Blocking (optional CancellationToken supported)
 buffer.WaitWrite(data, TimeSpan.FromMilliseconds(100));
 buffer.WaitRead(data, TimeSpan.FromMilliseconds(100));
+
+var cts = new CancellationTokenSource();
+buffer.WaitWrite(data, TimeSpan.FromSeconds(5), cts.Token);
+buffer.WaitRead(data, TimeSpan.FromSeconds(5), cts.Token);
 ```
 
 ### MpmcCircularBuffer
 
 ```csharp
-using var buffer = new MpmcCircularBuffer("MpmcQueue", slotCount: 16, slotSize: 256);
+// maxSpins controls how many times TryWrite/TryRead spins before giving up (default: 100)
+using var buffer = new MpmcCircularBuffer("MpmcQueue", slotCount: 16, slotSize: 256, maxSpins: 100);
 
 Parallel.For(0, 10, i => buffer.TryWrite(BitConverter.GetBytes(i)));
 
@@ -338,7 +343,18 @@ string msg = mem.ReadUtf8String("Message");
 dotnet test
 ```
 
-389 tests (95.1% line coverage, 88.4% branch coverage): unit, concurrency, stress, boundary conditions, schema compatibility, reentrant locks, blob/UTF-8 fields, IPC, and extreme load scenarios.
+372 tests pass across all standard categories. 2 long-running stress tests are marked `[Explicit]` and must be run manually:
+
+```bash
+# Run only the explicit long-running tests
+dotnet test --filter "FullyQualifiedName~MPMC_16Producers|FullyQualifiedName~Stability_MPMC"
+```
+
+Test categories:
+- **Unit** — single-class functional tests
+- **Concurrency** — multi-thread correctness and stress
+- **CrossProcess** — 6 tests that spawn `SharedMemory.IpcHelper.exe` to validate real IPC
+- **Extreme** — long-running stability tests (explicit only)
 
 ### Coverage by Class
 
@@ -354,7 +370,9 @@ dotnet test
 | `MpmcCircularBuffer` | 95.4% | 85%+ |
 | `HighPerformanceSharedBuffer` | 88.3% | 80%+ |
 
-> `HighPerformanceSharedBuffer` remaining uncovered lines are OS-level failure paths (MMF allocation failure, cleanup exceptions) and cross-process orphan lock scenarios that require process death simulation.
+> `HighPerformanceSharedBuffer` remaining uncovered lines are OS-level failure paths (MMF allocation failure, cleanup exceptions) that require process death simulation.
+
+> **Note:** Performance figures below were measured on the original implementation. Hot-path changes (Interlocked removal, SIMD path, false-sharing fixes) may have shifted these numbers. Re-run `SharedMemory.Benchmark` to get current figures.
 
 ## Project Structure
 
@@ -364,19 +382,25 @@ SharedMemory/                          # Core library
 ├── SharedMemoryBufferOptions.cs       # Configuration options
 ├── HighPerformanceSharedBuffer.cs     # Raw byte buffer with SIMD & orphan lock detection
 ├── LockFreeCircularBuffer.cs          # SPSC queue
-├── MpmcCircularBuffer.cs             # MPMC queue
-├── StrictSharedMemory.cs             # Schema-based typed memory access
+├── MpmcCircularBuffer.cs              # MPMC queue
+├── SchemaTypes.cs                     # SharedTypeCode, SchemaCompatibility, ISharedMemorySchema, IVersionedSchema
+├── FieldDefinition.cs                 # FieldDefinition struct + type-code lookup table
+├── StrictSharedMemory.cs              # Schema-based typed memory access
 └── SharedArray.cs                     # Generic shared T[] with indexer
 
-SharedMemory.Tests/                    # 339 tests (NUnit)
+SharedMemory.Tests/                    # 372 tests (NUnit)
 ├── HighPerformanceSharedBufferTests.cs
 ├── LockFreeCircularBufferTests.cs
 ├── MpmcCircularBufferTests.cs
 ├── StrictSharedMemoryTests.cs
 ├── SharedArrayTests.cs
 ├── AdvancedTests.cs                   # Concurrency & edge cases
-├── ExtremeStressTests.cs              # Extreme load scenarios
-└── CoverageBoostTests.cs             # Validation, reentrant locks, rare paths
+├── ExtremeStressTests.cs              # Extreme load scenarios (2 explicit long-running)
+├── CoverageBoostTests.cs              # Validation, reentrant locks, rare paths
+└── CrossProcessTests.cs               # Real IPC tests (spawns SharedMemory.IpcHelper.exe)
+
+SharedMemory.IpcHelper/                # Child process for cross-process IPC tests
+└── Program.cs
 
 SharedMemory.Benchmark/                # BenchmarkDotNet
 └── *.cs

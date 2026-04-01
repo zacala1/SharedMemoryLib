@@ -236,14 +236,19 @@ namespace SharedMemory
         /// <summary>
         /// Waits until data can be written, with spinning and yielding strategy
         /// </summary>
-        public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout)
+        /// <param name="data">Data to write</param>
+        /// <param name="timeout">Maximum time to wait</param>
+        /// <param name="cancellationToken">Token to cancel the wait</param>
+        /// <returns>True if write succeeded; false on timeout or cancellation</returns>
+        public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout,
+            CancellationToken cancellationToken = default)
         {
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
 
             while (!TryWrite(data))
             {
-                if (sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
                     return false;
 
                 spinner.SpinOnce();
@@ -256,7 +261,12 @@ namespace SharedMemory
         /// <summary>
         /// Waits until data can be read, with spinning and yielding strategy
         /// </summary>
-        public int WaitRead(Span<byte> destination, TimeSpan timeout)
+        /// <param name="destination">Buffer to read into</param>
+        /// <param name="timeout">Maximum time to wait</param>
+        /// <param name="cancellationToken">Token to cancel the wait</param>
+        /// <returns>Number of bytes read; 0 on timeout or cancellation</returns>
+        public int WaitRead(Span<byte> destination, TimeSpan timeout,
+            CancellationToken cancellationToken = default)
         {
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
@@ -264,7 +274,7 @@ namespace SharedMemory
 
             while ((bytesRead = TryRead(destination)) == 0)
             {
-                if (sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
                     return 0;
 
                 spinner.SpinOnce();
@@ -298,7 +308,8 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long CalculateAvailable(long writePos, long readPos)
         {
-            return _capacity - (writePos - readPos);
+            // SPSC guarantees writePos >= readPos, but guard against races during Clear()
+            return Math.Max(0, _capacity - (writePos - readPos));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

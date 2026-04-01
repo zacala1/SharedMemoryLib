@@ -25,6 +25,17 @@
 
   <ItemGroup>
     <ProjectReference Include="..\SharedMemory\SharedMemory.csproj" />
+    <!-- IpcHelper is built alongside tests so CrossProcessTests can spawn it -->
+    <ProjectReference Include="..\SharedMemory.IpcHelper\SharedMemory.IpcHelper.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <!-- Copy IpcHelper EXE to test output directory so tests can locate it -->
+  <Target Name="CopyIpcHelper" AfterTargets="Build">
+    <ItemGroup>
+      <IpcHelperFiles Include="$(MSBuildThisFileDirectory)..\SharedMemory.IpcHelper\bin\$(Configuration)\net8.0-windows\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(IpcHelperFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

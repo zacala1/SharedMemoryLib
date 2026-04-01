@@ -39,34 +39,33 @@ namespace SharedMemory
         private volatile int _disposed;
 
         /// <summary>
-        /// Extended header structure with orphan lock detection support
+        /// Extended header structure with orphan lock detection support.
+        /// WriterLockState and ReaderCount are placed in separate 64-byte cache lines
+        /// to prevent false sharing when multiple processes or threads contend concurrently.
         /// </summary>
-        [StructLayout(LayoutKind.Sequential, Pack = 8)]
+        [StructLayout(LayoutKind.Explicit, Size = 128)]
         private struct SharedHeader
         {
             public const uint MagicNumber = 0x48504D53; // "SMHP"
-            public const int Size = 128; // Extended for lock owner info
+            public const int Size = 128;
 
-            public uint Magic;
-            public uint Version;
-            public long Capacity;
-            public long CreationTimestamp;
-            public int WriterLockState; // 0 = free, 1 = locked (accessed via Interlocked/Volatile)
-            public int ReaderCount; // accessed via Interlocked/Volatile
+            // Cache line 0 (offsets 0–63): writer-side fields
+            [FieldOffset(0)]  public uint Magic;
+            [FieldOffset(4)]  public uint Version;
+            [FieldOffset(8)]  public long Capacity;
+            [FieldOffset(16)] public long CreationTimestamp;
+            [FieldOffset(24)] public int WriterLockState;       // 0 = free, 1 = locked (Interlocked/Volatile)
+            [FieldOffset(28)] public int LockOwnerProcessId;
+            [FieldOffset(32)] public long LockOwnerThreadId;
+            [FieldOffset(40)] public long LockAcquiredTimestamp;
+            // bytes 48–63: implicit padding
 
-            // Orphan lock detection fields
-            public int LockOwnerProcessId;
-            public long LockOwnerThreadId;
-            public long LockAcquiredTimestamp;
-
-            // Checksum for integrity verification
-            public uint DataChecksum;
-            public long ChecksumOffset;
-            public int ChecksumLength;
-
-            // Padding to 128 bytes
-            public long Padding1;
-            public long Padding2;
+            // Cache line 1 (offsets 64–127): reader-side fields and checksum metadata
+            [FieldOffset(64)] public int ReaderCount;           // accessed via Interlocked/Volatile
+            [FieldOffset(68)] public uint DataChecksum;
+            [FieldOffset(72)] public long ChecksumOffset;
+            [FieldOffset(80)] public int ChecksumLength;
+            // bytes 84–127: implicit padding
         }
 
         private const long HeaderSize = SharedHeader.Size;
@@ -196,7 +195,9 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ValidateOffset(long offset, int length)
         {
-            // Check for negative offset or length first (prevents ulong overflow wraparound)
+            // Explicit negative checks are required before the ulong cast:
+            // (ulong)(-1) + (ulong)10 wraps around to 9 in unchecked arithmetic,
+            // so a single ulong comparison would silently pass a negative offset.
             if (offset < 0 || length < 0 || (ulong)offset + (ulong)length > (ulong)_capacity)
                 throw new ArgumentOutOfRangeException(nameof(offset),
                     $"Access at offset {offset} with length {length} exceeds capacity {_capacity}");
@@ -373,6 +374,7 @@ namespace SharedMemory
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
             bool orphanCheckDone = false;
+            bool orphanCheckNearTimeout = false;
 
             while (true)
             {
@@ -418,17 +420,24 @@ namespace SharedMemory
                 if (sw.Elapsed > timeout)
                     return false;
 
-                // Check for orphan lock only once per acquisition attempt (after first CAS failure)
-                // This avoids TOCTOU race by checking inside the spin loop
-                if (_options.EnableOrphanLockDetection && !orphanCheckDone)
+                if (_options.EnableOrphanLockDetection)
                 {
-                    orphanCheckDone = true;
-                    if (IsWriteLockOrphaned())
+                    // Check on first CAS failure; re-check when nearing timeout (≥75% elapsed)
+                    // so a lock that becomes orphaned mid-wait is still recovered before giving up.
+                    bool nearTimeout = timeout > TimeSpan.Zero &&
+                        sw.Elapsed.TotalMilliseconds >= timeout.TotalMilliseconds * 0.75;
+
+                    if (!orphanCheckDone || (nearTimeout && !orphanCheckNearTimeout))
                     {
-                        _logger?.LogWarning("Detected orphan write lock, attempting recovery");
-                        TryForceReleaseWriteLock();
-                        // Continue loop to retry CAS immediately after recovery
-                        continue;
+                        if (!orphanCheckDone) orphanCheckDone = true;
+                        else orphanCheckNearTimeout = true;
+
+                        if (IsWriteLockOrphaned())
+                        {
+                            _logger?.LogWarning("Detected orphan write lock, attempting recovery");
+                            TryForceReleaseWriteLock();
+                            continue;
+                        }
                     }
                 }
 

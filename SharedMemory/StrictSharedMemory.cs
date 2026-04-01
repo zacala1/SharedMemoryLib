@@ -9,70 +9,6 @@ using System.Threading;
 namespace SharedMemory
 {
     /// <summary>
-    /// Type code enumeration for shared memory field types
-    /// </summary>
-    public enum SharedTypeCode
-    {
-        /// <summary>Unknown or unsupported type</summary>
-        Unknown = 0,
-        /// <summary>Boolean type (1 byte)</summary>
-        Boolean,
-        /// <summary>Unsigned byte (1 byte)</summary>
-        Byte,
-        /// <summary>Signed byte (1 byte)</summary>
-        SByte,
-        /// <summary>Unicode character (2 bytes)</summary>
-        Char,
-        /// <summary>16-bit signed integer (2 bytes)</summary>
-        Int16,
-        /// <summary>16-bit unsigned integer (2 bytes)</summary>
-        UInt16,
-        /// <summary>32-bit signed integer (4 bytes)</summary>
-        Int32,
-        /// <summary>32-bit unsigned integer (4 bytes)</summary>
-        UInt32,
-        /// <summary>64-bit signed integer (8 bytes)</summary>
-        Int64,
-        /// <summary>64-bit unsigned integer (8 bytes)</summary>
-        UInt64,
-        /// <summary>Single-precision floating point (4 bytes)</summary>
-        Single,
-        /// <summary>Double-precision floating point (8 bytes)</summary>
-        Double,
-        /// <summary>Decimal type (16 bytes)</summary>
-        Decimal,
-        /// <summary>GUID type (16 bytes)</summary>
-        Guid,
-        /// <summary>DateTime type (8 bytes)</summary>
-        DateTime,
-        /// <summary>TimeSpan type (8 bytes)</summary>
-        TimeSpan,
-        /// <summary>DateTimeOffset type (16 bytes)</summary>
-        DateTimeOffset,
-        /// <summary>Custom unmanaged struct</summary>
-        Struct,
-        /// <summary>Fixed-size binary blob with 4-byte length prefix</summary>
-        Blob,
-        /// <summary>UTF-8 encoded string with 4-byte length prefix</summary>
-        Utf8String
-    }
-
-    /// <summary>
-    /// Schema compatibility mode for version handling
-    /// </summary>
-    public enum SchemaCompatibility
-    {
-        /// <summary>Exact version match required</summary>
-        Strict,
-        /// <summary>Allow reading from newer compatible versions</summary>
-        Forward,
-        /// <summary>Allow reading from older compatible versions</summary>
-        Backward,
-        /// <summary>Allow both forward and backward compatibility</summary>
-        Full
-    }
-
-    /// <summary>
     /// Strictly-typed shared memory with compile-time schema enforcement and versioning.
     /// All fields are declared upfront with fixed types, positions, and sizes.
     /// Provides zero-allocation access with full type safety.
@@ -82,7 +18,11 @@ namespace SharedMemory
     {
         private const int SchemaHeaderSize = 64; // Reserved for schema metadata
         private const uint SchemaMagic = 0x53534D53; // "SSMS"
-        private const int AtomicThreshold = 8; // Types larger than 8 bytes need automatic locking
+        // x86-64 guarantees atomic load/store for aligned values up to 8 bytes (MOV instruction).
+        // Types wider than this threshold require automatic locking to prevent torn reads/writes.
+        // Note: ARM64 supports 16-byte atomics (ldp/stp) but .NET on Windows ARM64 uses TSO
+        // emulation, so 8 bytes is the safe cross-platform limit for this Windows-only library.
+        private const int AtomicThreshold = 8;
         private const int MaxStackAllocBytes = 1024; // Max bytes for stackalloc (prevent stack overflow)
 
         // Cached TimeSpan to avoid repeated allocations
@@ -92,6 +32,7 @@ namespace SharedMemory
         private readonly TSchema _schema;
         private readonly Dictionary<string, FieldMetadata> _fields;
         private readonly SchemaCompatibility _compatibility;
+        private readonly int _schemaHash; // computed once at construction, reused for write and validate
         private volatile int _disposed;
 
         // Per-instance thread-local lock depth tracking (no boxing, no dictionary lookup)
@@ -139,8 +80,14 @@ namespace SharedMemory
             _compatibility = compatibility;
             _fields = BuildFieldMetadata(schema);
 
+            if (_fields.Count == 0)
+                throw new ArgumentException("Schema must define at least one field", nameof(schema));
+
             // Get schema version from interface if available
             SchemaVersion = schema is IVersionedSchema versioned ? versioned.Version : 1;
+
+            // Compute hash once; reused in WriteSchemaHeader and ValidateSchemaCompatibility
+            _schemaHash = ComputeSchemaHash();
 
             long totalSize = SchemaHeaderSize + CalculateTotalSize(_fields);
 
@@ -195,9 +142,10 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteInternal<T>(T value, FieldMetadata metadata) where T : unmanaged
         {
-            Span<byte> buffer = stackalloc byte[Unsafe.SizeOf<T>()];
-            MemoryMarshal.Write(buffer, in value);
-            _buffer.Write(buffer, SchemaHeaderSize + metadata.Offset);
+            // MemoryMarshal.CreateSpan + AsBytes avoids a stackalloc by reinterpreting
+            // the local variable directly as bytes without any extra copy.
+            _buffer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
+                SchemaHeaderSize + metadata.Offset);
         }
 
         /// <summary>
@@ -230,9 +178,10 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private T ReadInternal<T>(FieldMetadata metadata) where T : unmanaged
         {
-            Span<byte> buffer = stackalloc byte[Unsafe.SizeOf<T>()];
-            _buffer.Read(buffer, SchemaHeaderSize + metadata.Offset);
-            return MemoryMarshal.Read<T>(buffer);
+            T value = default;
+            _buffer.Read(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
+                SchemaHeaderSize + metadata.Offset);
+            return value;
         }
 
         /// <summary>
@@ -259,16 +208,9 @@ namespace SharedMemory
             var bytes = MemoryMarshal.AsBytes(values);
 
             // Auto-lock for non-atomic operations (>8 bytes)
-            bool needsAutoLock = bytes.Length > AtomicThreshold && !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireWriteLock();
-                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
-            }
-            else
-            {
-                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
-            }
+            using var _ = (bytes.Length > AtomicThreshold && !IsHoldingAnyLock())
+                ? AcquireWriteLock() : default;
+            _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
         }
 
         /// <summary>
@@ -295,16 +237,9 @@ namespace SharedMemory
             var bytes = MemoryMarshal.AsBytes(destination);
 
             // Auto-lock for non-atomic operations (>8 bytes)
-            bool needsAutoLock = bytes.Length > AtomicThreshold && !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireReadLock();
-                _buffer.Read(bytes, SchemaHeaderSize + metadata.Offset);
-            }
-            else
-            {
-                _buffer.Read(bytes, SchemaHeaderSize + metadata.Offset);
-            }
+            using var _ = (bytes.Length > AtomicThreshold && !IsHoldingAnyLock())
+                ? AcquireReadLock() : default;
+            _buffer.Read(bytes, SchemaHeaderSize + metadata.Offset);
         }
 
         /// <summary>
@@ -330,16 +265,10 @@ namespace SharedMemory
                     nameof(value));
 
             // Auto-lock for string operations (always non-atomic)
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireWriteLock();
-                WriteStringInternal(value, metadata);
-            }
-            else
-            {
-                WriteStringInternal(value, metadata);
-            }
+            // AcquireWriteLock is reentrant; default(WriteLock).Dispose() is a no-op,
+            // so the ternary avoids acquiring a write lock while a read lock is held (deadlock).
+            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
+            WriteStringInternal(value, metadata);
         }
 
         private void WriteStringInternal(string value, FieldMetadata metadata)
@@ -392,17 +321,8 @@ namespace SharedMemory
             if (!metadata.IsString)
                 throw new InvalidOperationException($"Field '{fieldName}' is not a string");
 
-            // Auto-lock for string operations (always non-atomic)
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireReadLock();
-                return ReadStringInternal(metadata);
-            }
-            else
-            {
-                return ReadStringInternal(metadata);
-            }
+            using var _ = IsHoldingAnyLock() ? default : AcquireReadLock();
+            return ReadStringInternal(metadata);
         }
 
         private string ReadStringInternal(FieldMetadata metadata)
@@ -471,16 +391,8 @@ namespace SharedMemory
                     $"Data length {data.Length} exceeds blob capacity {maxDataSize}",
                     nameof(data));
 
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireWriteLock();
-                WriteBlobInternal(data, metadata);
-            }
-            else
-            {
-                WriteBlobInternal(data, metadata);
-            }
+            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
+            WriteBlobInternal(data, metadata);
         }
 
         private void WriteBlobInternal(ReadOnlySpan<byte> data, FieldMetadata metadata)
@@ -531,16 +443,8 @@ namespace SharedMemory
             if (!metadata.IsBlob)
                 throw new InvalidOperationException($"Field '{fieldName}' is not a blob");
 
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireReadLock();
-                return ReadBlobInternal(metadata);
-            }
-            else
-            {
-                return ReadBlobInternal(metadata);
-            }
+            using var _ = IsHoldingAnyLock() ? default : AcquireReadLock();
+            return ReadBlobInternal(metadata);
         }
 
         private byte[] ReadBlobInternal(FieldMetadata metadata)
@@ -591,16 +495,8 @@ namespace SharedMemory
                     $"UTF-8 encoded length {byteCount} exceeds field capacity {maxDataSize}",
                     nameof(value));
 
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireWriteLock();
-                WriteUtf8StringInternal(value, byteCount, metadata);
-            }
-            else
-            {
-                WriteUtf8StringInternal(value, byteCount, metadata);
-            }
+            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
+            WriteUtf8StringInternal(value, byteCount, metadata);
         }
 
         private void WriteUtf8StringInternal(string value, int byteCount, FieldMetadata metadata)
@@ -657,16 +553,8 @@ namespace SharedMemory
             if (!metadata.IsUtf8String)
                 throw new InvalidOperationException($"Field '{fieldName}' is not a UTF-8 string");
 
-            bool needsAutoLock = !IsHoldingAnyLock();
-            if (needsAutoLock)
-            {
-                using var _ = AcquireReadLock();
-                return ReadUtf8StringInternal(metadata);
-            }
-            else
-            {
-                return ReadUtf8StringInternal(metadata);
-            }
+            using var _ = IsHoldingAnyLock() ? default : AcquireReadLock();
+            return ReadUtf8StringInternal(metadata);
         }
 
         private string ReadUtf8StringInternal(FieldMetadata metadata)
@@ -790,7 +678,7 @@ namespace SharedMemory
             // Write field count
             BitConverter.TryWriteBytes(header.Slice(8), _fields.Count);
             // Write schema hash for quick compatibility check
-            BitConverter.TryWriteBytes(header.Slice(12), CalculateSchemaHash());
+            BitConverter.TryWriteBytes(header.Slice(12), _schemaHash);
 
             _buffer.Write(header, 0);
         }
@@ -837,14 +725,14 @@ namespace SharedMemory
             }
 
             // Verify schema hash if versions match
-            if (StoredSchemaVersion == SchemaVersion && storedHash != CalculateSchemaHash())
+            if (StoredSchemaVersion == SchemaVersion && storedHash != _schemaHash)
             {
                 throw new InvalidOperationException(
                     "Schema hash mismatch - the schema structure has changed");
             }
         }
 
-        private int CalculateSchemaHash()
+        private int ComputeSchemaHash()
         {
             // Sort field names for deterministic hash (replaces LINQ OrderBy)
             var fieldValues = new List<FieldMetadata>(_fields.Values);
@@ -939,7 +827,10 @@ namespace SharedMemory
 
         private void InitializeMemory()
         {
-            Span<byte> zeros = stackalloc byte[4096];
+            // Allocate only as much stack space as needed; avoids wasting 4096 bytes
+            // when the buffer is smaller (e.g. a schema with a single small field).
+            int chunkSize = (int)Math.Min(4096, _buffer.Capacity);
+            Span<byte> zeros = stackalloc byte[chunkSize];
             zeros.Clear();
 
             long offset = 0;
@@ -947,10 +838,10 @@ namespace SharedMemory
 
             while (remaining > 0)
             {
-                int chunkSize = (int)Math.Min(zeros.Length, remaining);
-                _buffer.Write(zeros.Slice(0, chunkSize), offset);
-                offset += chunkSize;
-                remaining -= chunkSize;
+                int write = (int)Math.Min(zeros.Length, remaining);
+                _buffer.Write(zeros.Slice(0, write), offset);
+                offset += write;
+                remaining -= write;
             }
         }
 
@@ -1105,278 +996,4 @@ namespace SharedMemory
         }
     }
 
-    /// <summary>
-    /// Interface for versioned schemas
-    /// </summary>
-    public interface IVersionedSchema : ISharedMemorySchema
-    {
-        /// <summary>
-        /// Gets the schema version number
-        /// </summary>
-        int Version { get; }
-
-        /// <summary>
-        /// Checks compatibility with another version
-        /// </summary>
-        bool IsCompatibleWith(int otherVersion);
-    }
-
-    /// <summary>
-    /// Schema interface that must be implemented by all strict shared memory schemas.
-    /// </summary>
-    public interface ISharedMemorySchema
-    {
-        /// <summary>
-        /// Returns all field definitions in the schema.
-        /// Order determines memory layout.
-        /// </summary>
-        IEnumerable<FieldDefinition> GetFields();
-    }
-
-    /// <summary>
-    /// Defines a single field in a strict shared memory schema.
-    /// </summary>
-    public readonly struct FieldDefinition
-    {
-        /// <summary>Gets the field name</summary>
-        public string Name { get; init; }
-
-        /// <summary>Gets the type code of the field</summary>
-        public SharedTypeCode TypeCode { get; init; }
-
-        /// <summary>Gets the size of a single element in bytes</summary>
-        public int ElementSize { get; init; }
-
-        /// <summary>Gets the array length (1 for scalars)</summary>
-        public int ArrayLength { get; init; }
-
-        /// <summary>Gets the memory alignment requirement</summary>
-        public int Alignment { get; init; }
-
-        /// <summary>Gets the total size of the field in bytes</summary>
-        public int Size => ElementSize * ArrayLength;
-
-        /// <summary>
-        /// Creates a scalar field definition for a primitive type.
-        /// </summary>
-        /// <typeparam name="T">Unmanaged value type</typeparam>
-        /// <param name="name">Field name</param>
-        /// <returns>Field definition for a single value</returns>
-        public static FieldDefinition Scalar<T>(string name) where T : unmanaged
-        {
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = GetTypeCode<T>(),
-                ElementSize = Unsafe.SizeOf<T>(),
-                ArrayLength = 1,
-                Alignment = Unsafe.SizeOf<T>()
-            };
-        }
-
-        /// <summary>
-        /// Creates an array field definition for a fixed-size array of primitive types.
-        /// </summary>
-        /// <typeparam name="T">Unmanaged element type</typeparam>
-        /// <param name="name">Field name</param>
-        /// <param name="length">Number of elements in the array</param>
-        /// <returns>Field definition for a fixed-size array</returns>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when length is not positive</exception>
-        public static FieldDefinition Array<T>(string name, int length) where T : unmanaged
-        {
-            if (length <= 0)
-                throw new ArgumentOutOfRangeException(nameof(length));
-
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = GetTypeCode<T>(),
-                ElementSize = Unsafe.SizeOf<T>(),
-                ArrayLength = length,
-                Alignment = Unsafe.SizeOf<T>()
-            };
-        }
-
-        /// <summary>
-        /// Creates a string field definition for a fixed-size null-terminated string.
-        /// </summary>
-        /// <param name="name">Field name</param>
-        /// <param name="maxLength">Maximum string length including null terminator</param>
-        /// <returns>Field definition for a fixed-size string</returns>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when maxLength is not positive</exception>
-        public static FieldDefinition String(string name, int maxLength)
-        {
-            if (maxLength <= 0)
-                throw new ArgumentOutOfRangeException(nameof(maxLength));
-
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = SharedTypeCode.Char,
-                ElementSize = sizeof(char),
-                ArrayLength = maxLength,
-                Alignment = sizeof(char)
-            };
-        }
-
-        internal static SharedTypeCode GetTypeCode<T>() where T : unmanaged
-        {
-            var type = typeof(T);
-
-            // Primitive types
-            if (type == typeof(bool))
-                return SharedTypeCode.Boolean;
-            if (type == typeof(byte))
-                return SharedTypeCode.Byte;
-            if (type == typeof(sbyte))
-                return SharedTypeCode.SByte;
-            if (type == typeof(char))
-                return SharedTypeCode.Char;
-            if (type == typeof(short))
-                return SharedTypeCode.Int16;
-            if (type == typeof(ushort))
-                return SharedTypeCode.UInt16;
-            if (type == typeof(int))
-                return SharedTypeCode.Int32;
-            if (type == typeof(uint))
-                return SharedTypeCode.UInt32;
-            if (type == typeof(long))
-                return SharedTypeCode.Int64;
-            if (type == typeof(ulong))
-                return SharedTypeCode.UInt64;
-            if (type == typeof(float))
-                return SharedTypeCode.Single;
-            if (type == typeof(double))
-                return SharedTypeCode.Double;
-            if (type == typeof(decimal))
-                return SharedTypeCode.Decimal;
-
-            // Extended types
-            if (type == typeof(System.Guid))
-                return SharedTypeCode.Guid;
-            if (type == typeof(System.DateTime))
-                return SharedTypeCode.DateTime;
-            if (type == typeof(System.TimeSpan))
-                return SharedTypeCode.TimeSpan;
-            if (type == typeof(System.DateTimeOffset))
-                return SharedTypeCode.DateTimeOffset;
-
-            // Enum types - use underlying type's code
-            if (type.IsEnum)
-            {
-                var underlyingType = Enum.GetUnderlyingType(type);
-                if (underlyingType == typeof(int))
-                    return SharedTypeCode.Int32;
-                if (underlyingType == typeof(byte))
-                    return SharedTypeCode.Byte;
-                if (underlyingType == typeof(short))
-                    return SharedTypeCode.Int16;
-                if (underlyingType == typeof(long))
-                    return SharedTypeCode.Int64;
-                if (underlyingType == typeof(uint))
-                    return SharedTypeCode.UInt32;
-                if (underlyingType == typeof(ushort))
-                    return SharedTypeCode.UInt16;
-                if (underlyingType == typeof(ulong))
-                    return SharedTypeCode.UInt64;
-                if (underlyingType == typeof(sbyte))
-                    return SharedTypeCode.SByte;
-            }
-
-            // Custom unmanaged struct
-            if (type.IsValueType && !type.IsPrimitive)
-                return SharedTypeCode.Struct;
-
-            return SharedTypeCode.Unknown;
-        }
-
-        /// <summary>
-        /// Creates a struct field definition for a custom unmanaged struct.
-        /// </summary>
-        /// <typeparam name="T">Unmanaged struct type</typeparam>
-        /// <param name="name">Field name</param>
-        /// <returns>Field definition for a struct value</returns>
-        public static FieldDefinition Struct<T>(string name) where T : unmanaged
-        {
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = SharedTypeCode.Struct,
-                ElementSize = Unsafe.SizeOf<T>(),
-                ArrayLength = 1,
-                Alignment = IntPtr.Size
-            };
-        }
-
-        /// <summary>
-        /// Creates an array field definition for a fixed-size array of custom unmanaged structs.
-        /// </summary>
-        /// <typeparam name="T">Unmanaged struct type</typeparam>
-        /// <param name="name">Field name</param>
-        /// <param name="length">Number of elements in the array</param>
-        /// <returns>Field definition for a fixed-size struct array</returns>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when length is not positive</exception>
-        public static FieldDefinition StructArray<T>(string name, int length) where T : unmanaged
-        {
-            if (length <= 0)
-                throw new ArgumentOutOfRangeException(nameof(length));
-
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = SharedTypeCode.Struct,
-                ElementSize = Unsafe.SizeOf<T>(),
-                ArrayLength = length,
-                Alignment = IntPtr.Size
-            };
-        }
-
-        /// <summary>
-        /// Creates a blob field definition for fixed-size binary data.
-        /// Layout: [4-byte length prefix] + [maxSize bytes of data].
-        /// Total storage = maxSize + 4 bytes.
-        /// </summary>
-        /// <param name="name">Field name</param>
-        /// <param name="maxSize">Maximum data size in bytes (excluding the 4-byte length prefix)</param>
-        /// <returns>Field definition for a blob value</returns>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when maxSize is not positive</exception>
-        public static FieldDefinition Blob(string name, int maxSize)
-        {
-            if (maxSize <= 0)
-                throw new ArgumentOutOfRangeException(nameof(maxSize));
-
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = SharedTypeCode.Blob,
-                ElementSize = 1,
-                ArrayLength = maxSize + 4, // 4-byte length prefix + data
-                Alignment = 4
-            };
-        }
-
-        /// <summary>
-        /// Creates a UTF-8 string field definition.
-        /// Layout: [4-byte byte-length prefix] + [maxByteLength bytes of UTF-8 data].
-        /// Total storage = maxByteLength + 4 bytes.
-        /// </summary>
-        /// <param name="name">Field name</param>
-        /// <param name="maxByteLength">Maximum UTF-8 encoded size in bytes (excluding the 4-byte length prefix)</param>
-        /// <returns>Field definition for a UTF-8 string value</returns>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when maxByteLength is not positive</exception>
-        public static FieldDefinition Utf8String(string name, int maxByteLength)
-        {
-            if (maxByteLength <= 0)
-                throw new ArgumentOutOfRangeException(nameof(maxByteLength));
-
-            return new FieldDefinition
-            {
-                Name = name,
-                TypeCode = SharedTypeCode.Utf8String,
-                ElementSize = 1,
-                ArrayLength = maxByteLength + 4, // 4-byte length prefix + data
-                Alignment = 4
-            };
-        }
-    }
 }

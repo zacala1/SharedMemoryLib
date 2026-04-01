@@ -62,6 +62,7 @@ namespace SharedMemory
         private readonly MemoryHandle _memoryHandle;
 
         private volatile int _disposed;
+        private readonly int _maxSpins;
 
         /// <summary>
         /// Gets the number of slots in the buffer
@@ -94,9 +95,14 @@ namespace SharedMemory
         /// <param name="slotCount">Number of slots (will be rounded up to power of 2)</param>
         /// <param name="slotSize">Size of each slot in bytes (including header)</param>
         /// <param name="create">True to create new, false to open existing</param>
+        /// <param name="maxSpins">
+        /// Maximum spin iterations before <see cref="TryWrite"/>/<see cref="TryRead"/> gives up.
+        /// Default 100 works well for typical workloads; increase for higher contention,
+        /// decrease (e.g. 10) for latency-sensitive scenarios that prefer fast failure.
+        /// </param>
         /// <exception cref="ArgumentException">Thrown when name is empty</exception>
-        /// <exception cref="ArgumentOutOfRangeException">Thrown when slotCount/slotSize is invalid or total size exceeds int.MaxValue</exception>
-        public MpmcCircularBuffer(string name, int slotCount, int slotSize, bool create = true)
+        /// <exception cref="ArgumentOutOfRangeException">Thrown when slotCount/slotSize is invalid, maxSpins is not positive, or total size exceeds int.MaxValue</exception>
+        public MpmcCircularBuffer(string name, int slotCount, int slotSize, bool create = true, int maxSpins = 100)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty", nameof(name));
@@ -104,7 +110,10 @@ namespace SharedMemory
                 throw new ArgumentOutOfRangeException(nameof(slotCount));
             if (slotSize <= SlotHeaderSize)
                 throw new ArgumentOutOfRangeException(nameof(slotSize), $"Slot size must be > {SlotHeaderSize}");
+            if (maxSpins <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxSpins), "maxSpins must be positive");
 
+            _maxSpins = maxSpins;
             _slotCount = RoundUpToPowerOf2(slotCount);
             _slotSize = slotSize;
             _slotTotalSize = _slotSize;
@@ -201,9 +210,8 @@ namespace SharedMemory
                 throw new ArgumentException($"Data size {data.Length} exceeds max {MaxMessageSize}");
 
             int spinCount = 0;
-            const int MaxSpins = 100;
 
-            while (spinCount < MaxSpins)
+            while (spinCount < _maxSpins)
             {
                 long currentWrite = Volatile.Read(ref _header->WriteSequence);
                 long index = currentWrite & _slotMask;
@@ -257,9 +265,8 @@ namespace SharedMemory
             ThrowIfDisposed();
 
             int spinCount = 0;
-            const int MaxSpins = 100;
 
-            while (spinCount < MaxSpins)
+            while (spinCount < _maxSpins)
             {
                 long currentRead = Volatile.Read(ref _header->ReadSequence);
                 long index = currentRead & _slotMask;
@@ -309,14 +316,19 @@ namespace SharedMemory
         /// <summary>
         /// Waits until data can be written, with timeout.
         /// </summary>
-        public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout)
+        /// <param name="data">Data to write</param>
+        /// <param name="timeout">Maximum time to wait</param>
+        /// <param name="cancellationToken">Token to cancel the wait</param>
+        /// <returns>True if write succeeded; false on timeout or cancellation</returns>
+        public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout,
+            CancellationToken cancellationToken = default)
         {
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
 
             while (!TryWrite(data))
             {
-                if (sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
                     return false;
 
                 spinner.SpinOnce();
@@ -328,7 +340,12 @@ namespace SharedMemory
         /// <summary>
         /// Waits until data can be read, with timeout.
         /// </summary>
-        public int WaitRead(Span<byte> destination, TimeSpan timeout)
+        /// <param name="destination">Buffer to read into</param>
+        /// <param name="timeout">Maximum time to wait</param>
+        /// <param name="cancellationToken">Token to cancel the wait</param>
+        /// <returns>Number of bytes read; 0 on timeout or cancellation</returns>
+        public int WaitRead(Span<byte> destination, TimeSpan timeout,
+            CancellationToken cancellationToken = default)
         {
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
@@ -336,7 +353,7 @@ namespace SharedMemory
 
             while ((bytesRead = TryRead(destination)) == 0)
             {
-                if (sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
                     return 0;
 
                 spinner.SpinOnce();
