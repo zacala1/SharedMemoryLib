@@ -392,6 +392,149 @@ public class ChangeVerificationTests
         Assert.That(s.GetFields(), Is.Not.Null);
     }
 
+    // ── #13 Auto-lock inside ReadLock-only (no WriteLock) ───────────────────
+
+    [Test]
+    public void AutoLock_WriteString_InsideReadLockOnly_NoDeadlock()
+    {
+        // When holding only a ReadLock, IsHoldingAnyLock() returns true, so WriteString
+        // skips AcquireWriteLock. This avoids deadlock (S-lock cannot upgrade to X-lock
+        // without releasing first). The caller is responsible for ensuring no concurrent writer.
+        var schema = new StringSchema();
+        using var mem = new StrictSharedMemory<StringSchema>(N("ALRL"), schema);
+
+        using (mem.AcquireReadLock())
+        {
+            Assert.DoesNotThrow(() => mem.WriteString(StringSchema.Name, "inside-readlock"));
+            Assert.That(mem.ReadString(StringSchema.Name), Is.EqualTo("inside-readlock"));
+        }
+    }
+
+    [Test]
+    public void AutoLock_WriteNonAtomicScalar_InsideReadLockOnly_NoDeadlock()
+    {
+        // Guid is 16 bytes > AtomicThreshold(8). Normally auto-locks, but when holding
+        // ReadLock the auto-lock is skipped to prevent deadlock — must not throw or hang.
+        var schema = new AllTypesSchema();
+        using var mem = new StrictSharedMemory<AllTypesSchema>(N("ALRG"), schema);
+        var guid = Guid.NewGuid();
+
+        using (mem.AcquireReadLock())
+        {
+            Assert.DoesNotThrow(() => mem.Write(AllTypesSchema.GuidF, guid));
+            Assert.That(mem.Read<Guid>(AllTypesSchema.GuidF), Is.EqualTo(guid));
+        }
+    }
+
+    // ── ValidateOffset edge cases ────────────────────────────────────────────
+
+    [Test]
+    public void ValidateOffset_LargePositiveOffset_Throws()
+    {
+        // Offset well beyond capacity — the ulong comparison should catch this
+        // even when offset is a large positive long (not negative).
+        var opts = new SharedMemoryBufferOptions { Capacity = 1024 };
+        using var buf = new HighPerformanceSharedBuffer(N("VOBig"), opts);
+
+        var data = new byte[10];
+        Assert.Throws<ArgumentOutOfRangeException>(() => buf.Write(data, long.MaxValue - 5));
+        Assert.Throws<ArgumentOutOfRangeException>(() => buf.Read(data, long.MaxValue - 5));
+    }
+
+    [Test]
+    public void ValidateOffset_OffsetPlusLengthExceedsCapacity_Throws()
+    {
+        // offset valid alone but offset+length exceeds boundary
+        var opts = new SharedMemoryBufferOptions { Capacity = 64 };
+        using var buf = new HighPerformanceSharedBuffer(N("VOOL"), opts);
+
+        var data = new byte[10];
+        Assert.Throws<ArgumentOutOfRangeException>(() => buf.Write(data, 60)); // 60+10=70 > 64
+    }
+
+    // ── CalculateAvailable edge cases ────────────────────────────────────────
+
+    [Test]
+    public void LockFree_Available_FullBuffer_ReturnsZero()
+    {
+        // Fill the buffer completely — Available must not go negative, must be exactly 0
+        using var buf = new LockFreeCircularBuffer(N("AvFull"), 64);
+        var data = new byte[32];
+        buf.TryWrite(data);
+        buf.TryWrite(data); // second write fills to capacity
+        Assert.That(buf.Available, Is.EqualTo(0));
+    }
+
+    [Test]
+    public void LockFree_Available_AfterClear_IsPositive()
+    {
+        // Fill then Clear — Available should be restored (> 0)
+        using var buf = new LockFreeCircularBuffer(N("AvClr"), 64);
+        var data = new byte[32];
+        while (buf.TryWrite(data)) { }
+        Assert.That(buf.Available, Is.EqualTo(0), "should be full before clear");
+
+        buf.Clear();
+        Assert.That(buf.Available, Is.GreaterThan(0), "should have space after clear");
+    }
+
+    // ── InitializeMemory large schema (> 4096 bytes) ─────────────────────────
+
+    [Test]
+    public void InitializeMemory_LargeSchema_AllZeroOnCreation()
+    {
+        // Schema total size > 4096 bytes exercises the loop in InitializeMemory
+        // (default chunkSize=4096, multiple iterations required)
+        var schema = new LargeSchema();
+        using var mem = new StrictSharedMemory<LargeSchema>(N("LrgInit"), schema);
+
+        // Every element of the large array should be zero-initialized
+        var result = new double[LargeSchema.ElementCount];
+        mem.ReadArray<double>(LargeSchema.Data, result);
+        Assert.That(result, Is.All.EqualTo(0.0), "All elements should be zero on creation");
+    }
+
+    // ── AtomicThreshold boundary ─────────────────────────────────────────────
+
+    [Test]
+    public void AtomicThreshold_EightByteType_NoAutoLockNeeded()
+    {
+        // double is exactly 8 bytes == AtomicThreshold, so 8 > 8 is false → no auto-lock.
+        // Writing/reading double without any lock should work correctly on x86-64.
+        var schema = new AllTypesSchema();
+        using var mem = new StrictSharedMemory<AllTypesSchema>(N("AT8"), schema);
+
+        mem.Write(AllTypesSchema.DoubleF, Math.E);
+        Assert.That(mem.Read<double>(AllTypesSchema.DoubleF), Is.EqualTo(Math.E).Within(1e-15));
+    }
+
+    [Test]
+    public void AtomicThreshold_SixteenByteType_AutoLockApplied()
+    {
+        // Guid is 16 bytes > AtomicThreshold → auto-lock is acquired.
+        // Round-trip must be correct to confirm locking path is taken without error.
+        var schema = new AllTypesSchema();
+        using var mem = new StrictSharedMemory<AllTypesSchema>(N("AT16"), schema);
+        var expected = Guid.NewGuid();
+
+        mem.Write(AllTypesSchema.GuidF, expected);
+        Assert.That(mem.Read<Guid>(AllTypesSchema.GuidF), Is.EqualTo(expected));
+    }
+
+    // ── maxSpins edge values ─────────────────────────────────────────────────
+
+    [Test]
+    public void Mpmc_MaxSpins_IntMaxValue_DoesNotThrow()
+    {
+        // int.MaxValue is valid — no overflow, constructor must succeed
+        using var buf = new MpmcCircularBuffer(N("MxSpMax"), slotCount: 4, slotSize: 32,
+            maxSpins: int.MaxValue);
+        var data = BitConverter.GetBytes(99);
+        Assert.That(buf.TryWrite(data), Is.True);
+        var dst = new byte[16];
+        Assert.That(buf.TryRead(dst), Is.GreaterThan(0));
+    }
+
     // ── Schemas & helpers ────────────────────────────────────────────────────
 
     private enum TestEnumInt  : int  { A = 1 }
@@ -467,6 +610,17 @@ public class ChangeVerificationTests
         public IEnumerable<FieldDefinition> GetFields()
         {
             yield return FieldDefinition.Array<int>(Numbers, 10);
+        }
+    }
+
+    public struct LargeSchema : ISharedMemorySchema
+    {
+        public const string Data = "Data";
+        // 600 doubles = 4800 bytes > 4096, exercises InitializeMemory loop
+        public const int ElementCount = 600;
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Array<double>(Data, ElementCount);
         }
     }
 }
