@@ -9,12 +9,13 @@ Windows named shared memory is fast, but the raw API is tedious. This library wr
 ## Features
 
 - **SIMD Copy** — `Vector<T>` parallel processing (16-32 bytes/op)
-- **Lock-free SPSC/MPMC** — Circular buffers with cache-line padding
-- **Zero-allocation** — `Span<T>`, `stackalloc`, no GC pressure
-- **Schema Versioning** — Type-safe fields with compatibility modes
+- **Lock-free SPSC/MPMC** — Circular buffers with cache-line padding and false-sharing prevention
+- **Zero-allocation** — `Span<T>`, `MemoryMarshal`, no GC pressure in hot path
+- **Schema Versioning** — Type-safe fields with compatibility modes; empty schema rejected at construction
 - **Blob & UTF-8** — Binary data and UTF-8 strings with length prefix
-- **Orphan Lock Recovery** — Handles process crashes gracefully
+- **Orphan Lock Recovery** — Detects dead lock holders on first failure and again at 75% of timeout
 - **CRC32 Checksum** — Hardware-accelerated integrity verification
+- **Cancellable Waits** — `WaitWrite`/`WaitRead` accept `CancellationToken` on both SPSC and MPMC
 
 ## Requirements
 
@@ -151,10 +152,19 @@ buffer.WaitRead(data, TimeSpan.FromSeconds(5), cts.Token);
 ### MpmcCircularBuffer
 
 ```csharp
-// maxSpins controls how many times TryWrite/TryRead spins before giving up (default: 100)
+// maxSpins: how many times TryWrite/TryRead spins before giving up (default: 100)
+//   - increase for high-contention workloads
+//   - decrease (e.g. 10) for latency-sensitive scenarios that prefer fast failure
 using var buffer = new MpmcCircularBuffer("MpmcQueue", slotCount: 16, slotSize: 256, maxSpins: 100);
 
 Parallel.For(0, 10, i => buffer.TryWrite(BitConverter.GetBytes(i)));
+
+// Blocking with optional cancellation
+var cts = new CancellationTokenSource();
+buffer.WaitWrite(BitConverter.GetBytes(42), TimeSpan.FromSeconds(5), cts.Token);
+
+byte[] dst = new byte[256];
+buffer.WaitRead(dst, TimeSpan.FromSeconds(5), cts.Token);
 
 var stats = buffer.GetStatistics();
 Console.WriteLine($"Writes: {stats.TotalWrites}, Failed: {stats.FailedWrites}");
@@ -179,7 +189,8 @@ When a process holding a write lock crashes, other processes would be blocked fo
 
 1. **Process death detection** — Checks if the lock owner PID is still alive via `Process.GetProcessById()`
 2. **Timeout fallback** — If a lock is held longer than `OrphanLockTimeout` (default: 30s), it's considered orphaned
-3. **Safe CAS release** — Uses compare-and-swap on the owner PID to avoid releasing a valid lock that was acquired by a new process between the check and release
+3. **Double check** — Orphan detection runs on the first CAS failure *and* again when 75% of the wait timeout has elapsed, recovering locks that become orphaned mid-wait
+4. **Safe CAS release** — Uses compare-and-swap on the owner PID to avoid releasing a valid lock acquired by a new process between the check and release
 
 ```csharp
 // Automatic: TryAcquireWriteLock checks for orphans on first CAS failure
@@ -249,11 +260,13 @@ Measured on i7-12700K, DDR5-4800, .NET 8.
 | Write | 13.3 ns | 60.7 ns |
 | Read | 13.3 ns | 46.5 ns |
 
+> These figures were measured on the original implementation (i7-12700K, DDR5-4800, .NET 8). Subsequent hot-path changes (Interlocked removal on SPSC stats, `WriterLockState`/`ReaderCount` cache-line separation, `MemoryMarshal` instead of stackalloc) may have improved these numbers. Re-run `SharedMemory.Benchmark` to get current figures.
+
 ## Thread Safety
 
-Types larger than 8 bytes (`Guid`, `DateTimeOffset`, `decimal`, large structs, arrays, strings) can't be written atomically on x64. `StrictSharedMemory` automatically acquires locks for these types to prevent torn reads/writes.
+On x86-64, MOV is atomic for aligned values up to 8 bytes. Types wider than this threshold (`Guid`, `DateTimeOffset`, `decimal`, large structs, arrays, strings) require locking to prevent torn reads/writes. `StrictSharedMemory` applies this automatically.
 
-Locks are **reentrant**: nested `AcquireWriteLock()` / `AcquireReadLock()` calls from the same thread increment a depth counter instead of deadlocking. A read lock acquired inside a write lock is also safe.
+Locks are **reentrant**: nested `AcquireWriteLock()` / `AcquireReadLock()` calls from the same thread increment a depth counter instead of deadlocking. A read lock acquired inside a write lock is also safe. All string, blob, UTF-8, and array operations follow the same pattern — no deadlock even when called under an existing lock.
 
 ```csharp
 using (mem.AcquireWriteLock())
@@ -343,7 +356,7 @@ string msg = mem.ReadUtf8String("Message");
 dotnet test
 ```
 
-372 tests pass across all standard categories. 2 long-running stress tests are marked `[Explicit]` and must be run manually:
+394 tests pass across all standard categories. 2 long-running stability tests are marked `[Explicit]` and must be opted into manually:
 
 ```bash
 # Run only the explicit long-running tests
@@ -351,10 +364,13 @@ dotnet test --filter "FullyQualifiedName~MPMC_16Producers|FullyQualifiedName~Sta
 ```
 
 Test categories:
-- **Unit** — single-class functional tests
-- **Concurrency** — multi-thread correctness and stress
-- **CrossProcess** — 6 tests that spawn `SharedMemory.IpcHelper.exe` to validate real IPC
-- **Extreme** — long-running stability tests (explicit only)
+
+| Category | Count | Description |
+|----------|-------|-------------|
+| Unit / Concurrency | ~360 | Single-class functional, multi-thread, stress, boundary |
+| **Verification** | 22 | Targeted per-change functional validation |
+| **CrossProcess** | 6 | Spawns `SharedMemory.IpcHelper.exe` — real two-process IPC |
+| Extreme | 2 | Long-running stability (explicit only) |
 
 ### Coverage by Class
 
@@ -372,8 +388,6 @@ Test categories:
 
 > `HighPerformanceSharedBuffer` remaining uncovered lines are OS-level failure paths (MMF allocation failure, cleanup exceptions) that require process death simulation.
 
-> **Note:** Performance figures below were measured on the original implementation. Hot-path changes (Interlocked removal, SIMD path, false-sharing fixes) may have shifted these numbers. Re-run `SharedMemory.Benchmark` to get current figures.
-
 ## Project Structure
 
 ```text
@@ -388,7 +402,7 @@ SharedMemory/                          # Core library
 ├── StrictSharedMemory.cs              # Schema-based typed memory access
 └── SharedArray.cs                     # Generic shared T[] with indexer
 
-SharedMemory.Tests/                    # 372 tests (NUnit)
+SharedMemory.Tests/                    # 394 tests (NUnit)
 ├── HighPerformanceSharedBufferTests.cs
 ├── LockFreeCircularBufferTests.cs
 ├── MpmcCircularBufferTests.cs
@@ -397,6 +411,7 @@ SharedMemory.Tests/                    # 372 tests (NUnit)
 ├── AdvancedTests.cs                   # Concurrency & edge cases
 ├── ExtremeStressTests.cs              # Extreme load scenarios (2 explicit long-running)
 ├── CoverageBoostTests.cs              # Validation, reentrant locks, rare paths
+├── ChangeVerificationTests.cs         # 22 targeted per-change functional tests
 └── CrossProcessTests.cs               # Real IPC tests (spawns SharedMemory.IpcHelper.exe)
 
 SharedMemory.IpcHelper/                # Child process for cross-process IPC tests
