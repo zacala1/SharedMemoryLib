@@ -116,6 +116,10 @@ namespace SharedMemory
         /// Writes a strictly-typed value to a named field.
         /// For types larger than 8 bytes (non-atomic), automatic locking is applied.
         /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when the caller holds only a read lock and attempts to write a non-atomic value
+        /// (writing while holding the read lock would corrupt readers and upgrading is unsafe — it would deadlock).
+        /// </exception>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Write<T>(string fieldName, T value) where T : unmanaged
         {
@@ -126,10 +130,10 @@ namespace SharedMemory
 
             ValidateFieldType<T>(metadata);
 
-            // Auto-lock for non-atomic types (>8 bytes) to prevent torn writes
-            bool needsAutoLock = Unsafe.SizeOf<T>() > AtomicThreshold && !IsHoldingAnyLock();
-            if (needsAutoLock)
+            bool isNonAtomic = Unsafe.SizeOf<T>() > AtomicThreshold;
+            if (isNonAtomic && !IsHoldingWriteLock())
             {
+                ThrowIfHoldingReadLock();
                 using var _ = AcquireWriteLock();
                 WriteInternal(value, metadata);
             }
@@ -206,11 +210,19 @@ namespace SharedMemory
                     nameof(values));
 
             var bytes = MemoryMarshal.AsBytes(values);
+            bool isNonAtomic = bytes.Length > AtomicThreshold;
 
             // Auto-lock for non-atomic operations (>8 bytes)
-            using var _ = (bytes.Length > AtomicThreshold && !IsHoldingAnyLock())
-                ? AcquireWriteLock() : default;
-            _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
+            if (isNonAtomic && !IsHoldingWriteLock())
+            {
+                ThrowIfHoldingReadLock();
+                using var _ = AcquireWriteLock();
+                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
+            }
+            else
+            {
+                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
+            }
         }
 
         /// <summary>
@@ -264,11 +276,18 @@ namespace SharedMemory
                     $"String length {value.Length} exceeds field capacity {metadata.ArrayLength - 1} (including null terminator)",
                     nameof(value));
 
-            // Auto-lock for string operations (always non-atomic)
-            // AcquireWriteLock is reentrant; default(WriteLock).Dispose() is a no-op,
-            // so the ternary avoids acquiring a write lock while a read lock is held (deadlock).
-            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
-            WriteStringInternal(value, metadata);
+            // String writes are always non-atomic (>8 bytes). Reentrant: skip if already holding write lock.
+            // Holding only a read lock here is unsafe — upgrading would deadlock the current reader.
+            if (!IsHoldingWriteLock())
+            {
+                ThrowIfHoldingReadLock();
+                using var _ = AcquireWriteLock();
+                WriteStringInternal(value, metadata);
+            }
+            else
+            {
+                WriteStringInternal(value, metadata);
+            }
         }
 
         private void WriteStringInternal(string value, FieldMetadata metadata)
@@ -391,8 +410,17 @@ namespace SharedMemory
                     $"Data length {data.Length} exceeds blob capacity {maxDataSize}",
                     nameof(data));
 
-            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
-            WriteBlobInternal(data, metadata);
+            // Blob writes are non-atomic. Reentrant: skip if already holding write lock.
+            if (!IsHoldingWriteLock())
+            {
+                ThrowIfHoldingReadLock();
+                using var _ = AcquireWriteLock();
+                WriteBlobInternal(data, metadata);
+            }
+            else
+            {
+                WriteBlobInternal(data, metadata);
+            }
         }
 
         private void WriteBlobInternal(ReadOnlySpan<byte> data, FieldMetadata metadata)
@@ -495,8 +523,17 @@ namespace SharedMemory
                     $"UTF-8 encoded length {byteCount} exceeds field capacity {maxDataSize}",
                     nameof(value));
 
-            using var _ = IsHoldingAnyLock() ? default : AcquireWriteLock();
-            WriteUtf8StringInternal(value, byteCount, metadata);
+            // UTF-8 string writes are non-atomic. Reentrant: skip if already holding write lock.
+            if (!IsHoldingWriteLock())
+            {
+                ThrowIfHoldingReadLock();
+                using var _ = AcquireWriteLock();
+                WriteUtf8StringInternal(value, byteCount, metadata);
+            }
+            else
+            {
+                WriteUtf8StringInternal(value, byteCount, metadata);
+            }
         }
 
         private void WriteUtf8StringInternal(string value, int byteCount, FieldMetadata metadata)
@@ -897,6 +934,26 @@ namespace SharedMemory
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool IsHoldingAnyLock() => _writeLockDepth.Value > 0 || _readLockDepth.Value > 0;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool IsHoldingWriteLock() => _writeLockDepth.Value > 0;
+
+        /// <summary>
+        /// Throws when the current thread holds a read lock but no write lock.
+        /// Used to prevent a thread that is one of the active readers from attempting a write —
+        /// auto-acquiring a write lock from such a thread would deadlock (writer waits for ReaderCount=0,
+        /// but this very thread is one of the readers and cannot release until the call returns).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ThrowIfHoldingReadLock()
+        {
+            if (_readLockDepth.Value > 0 && _writeLockDepth.Value == 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot write while holding only a read lock. Release the read lock first, " +
+                    "or acquire a write lock before performing reads and writes together.");
+            }
+        }
 
         /// <summary>
         /// Releases all resources used by this shared memory region

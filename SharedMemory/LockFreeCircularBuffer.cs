@@ -308,8 +308,14 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long CalculateAvailable(long writePos, long readPos)
         {
-            // SPSC guarantees writePos >= readPos, but guard against races during Clear()
-            return Math.Max(0, _capacity - (writePos - readPos));
+            // SPSC guarantees 0 <= writePos - readPos <= _capacity, but Clear() races and
+            // observed-stale reads (writer sees an old readPos > writePos for a moment) can
+            // produce values outside that range. Clamp both ends so TryWrite never sees
+            // available > _capacity (which would falsely admit oversized writes).
+            long used = writePos - readPos;
+            if (used < 0) return _capacity;          // readPos raced ahead — treat as empty
+            if (used > _capacity) return 0;          // bogus state — refuse writes
+            return _capacity - used;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -323,7 +329,12 @@ namespace SharedMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private long CalculateUsed(long writePos, long readPos)
         {
-            return writePos - readPos;
+            // Same race window as CalculateAvailable — clamp to [0, _capacity] so
+            // TryRead doesn't try to read more than what actually fits in the buffer.
+            long used = writePos - readPos;
+            if (used < 0) return 0;
+            if (used > _capacity) return _capacity;
+            return used;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -395,34 +395,39 @@ public class ChangeVerificationTests
     // ── #13 Auto-lock inside ReadLock-only (no WriteLock) ───────────────────
 
     [Test]
-    public void AutoLock_WriteString_InsideReadLockOnly_NoDeadlock()
+    public void AutoLock_WriteString_InsideReadLockOnly_Throws()
     {
-        // When holding only a ReadLock, IsHoldingAnyLock() returns true, so WriteString
-        // skips AcquireWriteLock. This avoids deadlock (S-lock cannot upgrade to X-lock
-        // without releasing first). The caller is responsible for ensuring no concurrent writer.
+        // String writes are always non-atomic. The previous behavior skipped the auto-lock
+        // whenever any lock was held, allowing a string write while only a read lock was
+        // held — exposing other readers to a partially written buffer. The fix is to throw
+        // because attempting to upgrade the read lock would deadlock (the current thread
+        // is one of the readers the writer would be waiting on).
         var schema = new StringSchema();
         using var mem = new StrictSharedMemory<StringSchema>(N("ALRL"), schema);
 
         using (mem.AcquireReadLock())
         {
-            Assert.DoesNotThrow(() => mem.WriteString(StringSchema.Name, "inside-readlock"));
-            Assert.That(mem.ReadString(StringSchema.Name), Is.EqualTo("inside-readlock"));
+            Assert.Throws<InvalidOperationException>(
+                () => mem.WriteString(StringSchema.Name, "inside-readlock"));
         }
     }
 
     [Test]
-    public void AutoLock_WriteNonAtomicScalar_InsideReadLockOnly_NoDeadlock()
+    public void AutoLock_WriteNonAtomicScalar_InsideReadLockOnly_Throws()
     {
-        // Guid is 16 bytes > AtomicThreshold(8). Normally auto-locks, but when holding
-        // ReadLock the auto-lock is skipped to prevent deadlock — must not throw or hang.
+        // Guid is 16 bytes > AtomicThreshold(8) and requires a write lock to avoid torn
+        // writes. The previous behavior silently skipped the auto-lock whenever ANY lock
+        // was held — that allowed an unsafe write while only a read lock was held, exposing
+        // other readers to a half-written value. The fix is to throw: upgrading the read
+        // lock to a write lock on the same thread would deadlock (writer waits for
+        // ReaderCount=0, but this thread is one of the readers).
         var schema = new AllTypesSchema();
         using var mem = new StrictSharedMemory<AllTypesSchema>(N("ALRG"), schema);
         var guid = Guid.NewGuid();
 
         using (mem.AcquireReadLock())
         {
-            Assert.DoesNotThrow(() => mem.Write(AllTypesSchema.GuidF, guid));
-            Assert.That(mem.Read<Guid>(AllTypesSchema.GuidF), Is.EqualTo(guid));
+            Assert.Throws<InvalidOperationException>(() => mem.Write(AllTypesSchema.GuidF, guid));
         }
     }
 

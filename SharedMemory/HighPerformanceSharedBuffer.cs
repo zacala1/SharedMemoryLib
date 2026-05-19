@@ -212,7 +212,10 @@ namespace SharedMemory
 
             byte* destPtr = GetDataPtr() + offset;
 
-            if (_options.EnableSimd && IsAligned(destPtr) && source.Length >= Vector<byte>.Count)
+            // Use SIMD when length is at least one vector. On modern x86-64, unaligned SIMD
+            // via ReadUnaligned/WriteUnaligned has essentially no penalty, so gating on alignment
+            // (as the previous IsAligned check did) only hurt small writes by forcing the scalar fallback.
+            if (_options.EnableSimd && source.Length >= Vector<byte>.Count)
             {
                 WriteSimd(source, destPtr);
             }
@@ -221,9 +224,11 @@ namespace SharedMemory
                 source.CopyTo(new Span<byte>(destPtr, source.Length));
             }
 
-            // Non-atomic counters: approximate stats, avoids Interlocked overhead on hot path
-            _totalWrites++;
-            _totalBytesWritten += source.Length;
+            // Atomic counters: concurrent callers (e.g. multiple readers, or callers that bypass
+            // the lock pair) must not lose updates. Interlocked on x86-64 is ~10ns; negligible
+            // next to the actual memory copy on any non-trivial payload.
+            Interlocked.Increment(ref _totalWrites);
+            Interlocked.Add(ref _totalBytesWritten, source.Length);
 
             if (_options.EnableEvents)
             {
@@ -277,7 +282,9 @@ namespace SharedMemory
 
             byte* srcPtr = GetDataPtr() + offset;
 
-            if (_options.EnableSimd && IsAligned(srcPtr) && destination.Length >= Vector<byte>.Count)
+            // Same rationale as Write — alignment gating was costing performance for small reads
+            // without buying anything on modern hardware that handles unaligned SIMD natively.
+            if (_options.EnableSimd && destination.Length >= Vector<byte>.Count)
             {
                 ReadSimd(destination, srcPtr);
             }
@@ -286,8 +293,9 @@ namespace SharedMemory
                 new ReadOnlySpan<byte>(srcPtr, destination.Length).CopyTo(destination);
             }
 
-            _totalReads++;
-            _totalBytesRead += destination.Length;
+            // Same rationale as Write: concurrent readers must not lose stats updates.
+            Interlocked.Increment(ref _totalReads);
+            Interlocked.Add(ref _totalBytesRead, destination.Length);
 
             return destination.Length;
         }
@@ -315,9 +323,9 @@ namespace SharedMemory
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool IsAligned(void* ptr) =>
-            ((nuint)ptr & (nuint)(_options.Alignment - 1)) == 0;
+        // IsAligned helper was removed in favor of unconditional SIMD for length >= Vector<byte>.Count.
+        // _options.Alignment is still validated as a power of 2 for forward compatibility and
+        // for consumers that may use it for their own offset calculations.
 
         /// <inheritdoc/>
         public ValueTask<int> WriteAsync(ReadOnlyMemory<byte> source, long offset,

@@ -37,8 +37,12 @@ namespace SharedMemory
             [FieldOffset(256)] public long TotalReads;
             [FieldOffset(264)] public long FailedReads;
 
-            // Reserved (cache line 6: offset 320-383)
-            [FieldOffset(320)] public long Reserved;
+            // Extended counters (cache line 6: offset 320-383) — added for unambiguous diagnostics.
+            // SpinExhausted* counts the maxSpins-exceeded case (transient contention, retryable),
+            // distinct from FailedWrites/FailedReads which now count only "buffer full / empty".
+            // Older readers that don't know these fields simply see 0 — backward compatible.
+            [FieldOffset(320)] public long SpinExhaustedWrites;
+            [FieldOffset(328)] public long SpinExhaustedReads;
         }
 
         [StructLayout(LayoutKind.Sequential, Pack = 8)]
@@ -75,7 +79,14 @@ namespace SharedMemory
         public int MaxMessageSize => _slotSize - SlotHeaderSize;
 
         /// <summary>
-        /// Gets statistics about buffer operations
+        /// Gets statistics about buffer operations.
+        /// <para>
+        /// <c>FailedWrites</c> counts genuine "buffer full" outcomes (TryWrite returned false because
+        /// all slots are occupied). <c>FailedReads</c> counts genuine "buffer empty" outcomes.
+        /// Transient maxSpins-exhausted failures are tracked separately via
+        /// <see cref="GetExtendedStatistics"/> so that the basic counters reflect capacity pressure
+        /// rather than contention pressure.
+        /// </para>
         /// </summary>
         public (long TotalWrites, long TotalReads, long FailedWrites, long FailedReads) GetStatistics()
         {
@@ -85,6 +96,23 @@ namespace SharedMemory
                 Volatile.Read(ref _header->TotalReads),
                 Volatile.Read(ref _header->FailedWrites),
                 Volatile.Read(ref _header->FailedReads)
+            );
+        }
+
+        /// <summary>
+        /// Gets extended statistics that distinguish capacity failures from contention failures.
+        /// <para>
+        /// <c>SpinExhaustedWrites</c>/<c>SpinExhaustedReads</c> count operations that gave up after
+        /// reaching <c>maxSpins</c> while the slot was still being prepared by another thread —
+        /// these are typically retryable. High values suggest tuning maxSpins or reducing contention.
+        /// </para>
+        /// </summary>
+        public (long SpinExhaustedWrites, long SpinExhaustedReads) GetExtendedStatistics()
+        {
+            ThrowIfDisposed();
+            return (
+                Volatile.Read(ref _header->SpinExhaustedWrites),
+                Volatile.Read(ref _header->SpinExhaustedReads)
             );
         }
 
@@ -158,6 +186,8 @@ namespace SharedMemory
             _header->TotalReads = 0;
             _header->FailedWrites = 0;
             _header->FailedReads = 0;
+            _header->SpinExhaustedWrites = 0;
+            _header->SpinExhaustedReads = 0;
 
             // Ensure header is visible before initializing slots (important for weakly-ordered architectures)
             Thread.MemoryBarrier();
@@ -250,7 +280,9 @@ namespace SharedMemory
                 spinCount++;
             }
 
-            Interlocked.Increment(ref _header->FailedWrites);
+            // Exhausted maxSpins waiting for a slot that another writer was preparing —
+            // not a "buffer full" condition. Track separately so diagnostics aren't muddied.
+            Interlocked.Increment(ref _header->SpinExhaustedWrites);
             return false;
         }
 
@@ -258,7 +290,16 @@ namespace SharedMemory
         /// Tries to read data from the buffer.
         /// Lock-free operation safe for concurrent readers.
         /// </summary>
+        /// <param name="destination">
+        /// Destination span. Must be at least as large as the next message; otherwise an
+        /// <see cref="ArgumentException"/> is thrown WITHOUT consuming the message — caller can
+        /// retry with a larger buffer. Use <see cref="MaxMessageSize"/> to size the destination safely.
+        /// </param>
         /// <returns>Number of bytes read, or 0 if buffer is empty</returns>
+        /// <exception cref="ArgumentException">
+        /// Thrown when the next message does not fit in <paramref name="destination"/>. The slot is
+        /// left intact so the caller can retry with an adequately sized buffer.
+        /// </exception>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public int TryRead(Span<byte> destination)
         {
@@ -277,14 +318,25 @@ namespace SharedMemory
 
                 if (diff == 0)
                 {
+                    // Peek the message length BEFORE claiming the slot. If destination is too small,
+                    // throw without CAS so the message is preserved for a retry with a larger buffer.
+                    // This prevents silent data loss that would occur if we claimed and truncated.
+                    int peekLength = Volatile.Read(ref slot->DataLength);
+                    if (peekLength > destination.Length)
+                    {
+                        throw new ArgumentException(
+                            $"Destination size {destination.Length} is smaller than next message size {peekLength}. " +
+                            $"Slot was NOT consumed — retry with a buffer of at least {peekLength} bytes.",
+                            nameof(destination));
+                    }
+
                     // Slot has data ready for reading
                     if (Interlocked.CompareExchange(ref _header->ReadSequence, currentRead + 1, currentRead) == currentRead)
                     {
-                        // Successfully claimed the slot
+                        // Successfully claimed the slot. Re-read length (writer might have re-used
+                        // the slot if our peek raced, but the CAS+sequence guards us; this is a
+                        // safe re-read of the now-stable claimed slot's metadata).
                         int dataLength = slot->DataLength;
-
-                        if (dataLength > destination.Length)
-                            dataLength = destination.Length;
 
                         var slotData = GetSlotData(slot);
                         new ReadOnlySpan<byte>(slotData, dataLength).CopyTo(destination);
@@ -309,7 +361,9 @@ namespace SharedMemory
                 spinCount++;
             }
 
-            Interlocked.Increment(ref _header->FailedReads);
+            // Exhausted maxSpins waiting for a slot that another reader was preparing —
+            // not a "buffer empty" condition. Track separately so diagnostics aren't muddied.
+            Interlocked.Increment(ref _header->SpinExhaustedReads);
             return 0;
         }
 

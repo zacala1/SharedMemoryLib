@@ -1382,19 +1382,28 @@ public class CoverageBoostTests
     }
 
     [Test]
-    public void Mpmc_TryRead_SmallDestination_ShouldTruncate()
+    public void Mpmc_TryRead_SmallDestination_ShouldThrowAndPreserveMessage()
     {
+        // Previous behavior silently truncated the message when the destination was too small,
+        // which permanently consumed the slot — caller had no way to retry with a larger buffer
+        // and the rest of the message was lost. The fix is to throw BEFORE claiming the slot,
+        // so the message remains available for a retry with a correctly sized destination.
         using var buffer = new MpmcCircularBuffer("CovR2_MpmcTrunc", 4, 64);
 
         var data = new byte[40];
         Array.Fill(data, (byte)0xAB);
         buffer.TryWrite(data);
 
-        // Read into smaller buffer — should truncate
+        // Read into smaller buffer — should throw without consuming
         var small = new byte[10];
-        int read = buffer.TryRead(small);
-        Assert.That(read, Is.EqualTo(10));
-        Assert.That(small[0], Is.EqualTo(0xAB));
+        Assert.Throws<ArgumentException>(() => buffer.TryRead(small));
+
+        // Slot must still be readable with a correctly sized destination
+        var big = new byte[64];
+        int read = buffer.TryRead(big);
+        Assert.That(read, Is.EqualTo(40));
+        Assert.That(big[0], Is.EqualTo(0xAB));
+        Assert.That(big[39], Is.EqualTo(0xAB));
     }
 
     [Test]
