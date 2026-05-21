@@ -1,7 +1,7 @@
 using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 
 namespace SharedMemory
@@ -9,9 +9,9 @@ namespace SharedMemory
     /// <summary>
     /// High-performance generic shared array with type safety and zero-allocation indexer.
     /// Provides array-like access to shared memory with compile-time type checking.
+    /// Cross-platform: backed by <see cref="HighPerformanceSharedBuffer"/> which supports Windows and Linux.
     /// </summary>
     /// <typeparam name="T">Unmanaged value type</typeparam>
-    [SupportedOSPlatform("windows")]
     public sealed class SharedArray<T> : IDisposable where T : unmanaged
     {
         private readonly ISharedMemoryBuffer _buffer;
@@ -140,7 +140,10 @@ namespace SharedMemory
             int batchCount = Math.Min(count, 4096);
             int batchBytes = batchCount * _elementSize;
 
-            // Use stackalloc for small batches, ArrayPool for large
+            // Use stackalloc for small batches, ArrayPool for large.
+            // ArrayPool (vs GC.AllocateUninitializedArray) eliminates GC pressure when Fill is
+            // called repeatedly — common in init/reset patterns for shared arrays — and the
+            // rented buffer is short-lived, exactly the workload ArrayPool is tuned for.
             if (batchBytes <= 1024)
             {
                 Span<T> temp = stackalloc T[batchCount];
@@ -149,9 +152,17 @@ namespace SharedMemory
             }
             else
             {
-                T[] rented = GC.AllocateUninitializedArray<T>(batchCount);
-                rented.AsSpan(0, batchCount).Fill(value);
-                FillBatched(startIndex, count, rented.AsSpan(0, batchCount));
+                T[] rented = ArrayPool<T>.Shared.Rent(batchCount);
+                try
+                {
+                    var span = rented.AsSpan(0, batchCount);
+                    span.Fill(value);
+                    FillBatched(startIndex, count, span);
+                }
+                finally
+                {
+                    ArrayPool<T>.Shared.Return(rented);
+                }
             }
         }
 

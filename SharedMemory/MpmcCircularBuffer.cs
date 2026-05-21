@@ -3,7 +3,6 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 
 namespace SharedMemory
@@ -12,8 +11,8 @@ namespace SharedMemory
     /// Multi-Producer/Multi-Consumer lock-free circular buffer.
     /// Thread-safe for concurrent access from multiple writers and readers.
     /// Uses sequence numbers for coordination instead of simple head/tail pointers.
+    /// Cross-platform: backed by <see cref="HighPerformanceSharedBuffer"/> which supports Windows and Linux.
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public sealed unsafe class MpmcCircularBuffer : IDisposable
     {
         [StructLayout(LayoutKind.Explicit, Size = 384)]
@@ -333,19 +332,18 @@ namespace SharedMemory
                     // Slot has data ready for reading
                     if (Interlocked.CompareExchange(ref _header->ReadSequence, currentRead + 1, currentRead) == currentRead)
                     {
-                        // Successfully claimed the slot. Re-read length (writer might have re-used
-                        // the slot if our peek raced, but the CAS+sequence guards us; this is a
-                        // safe re-read of the now-stable claimed slot's metadata).
-                        int dataLength = slot->DataLength;
-
+                        // peekLength was published by the writer (it set DataLength BEFORE
+                        // Volatile.Write to slot->Sequence). No other thread can mutate this slot
+                        // until WE bump slot->Sequence on the line below — so re-reading would
+                        // just return the same value at the cost of an extra load.
                         var slotData = GetSlotData(slot);
-                        new ReadOnlySpan<byte>(slotData, dataLength).CopyTo(destination);
+                        new ReadOnlySpan<byte>(slotData, peekLength).CopyTo(destination);
 
                         // Release the slot for writing (Volatile.Write has release semantics)
                         Volatile.Write(ref slot->Sequence, currentRead + _slotCount);
                         Interlocked.Increment(ref _header->TotalReads);
 
-                        return dataLength;
+                        return peekLength;
                     }
                     // CAS failed, another reader won - retry
                 }

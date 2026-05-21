@@ -3,7 +3,6 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 
 namespace SharedMemory
@@ -21,8 +20,8 @@ namespace SharedMemory
     /// WARNING: This buffer is designed for SPSC (Single-Producer/Single-Consumer) use only.
     /// Using multiple producers OR multiple consumers concurrently will cause data corruption.
     /// For multi-producer/multi-consumer scenarios, use <see cref="MpmcCircularBuffer"/> instead.
+    /// Cross-platform: backed by <see cref="HighPerformanceSharedBuffer"/> which supports Windows and Linux.
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public sealed unsafe class LockFreeCircularBuffer : IDisposable
     {
         [StructLayout(LayoutKind.Sequential, Pack = 8, Size = 128)]
@@ -154,7 +153,10 @@ namespace SharedMemory
             if (data.Length > _capacity)
                 throw new ArgumentException($"Data size {data.Length} exceeds capacity {_capacity}");
 
-            long writePos = Volatile.Read(ref _header->WritePosition);
+            // SPSC: only this thread (the writer) mutates WritePosition, so a plain load is safe —
+            // no need for acquire semantics. ReadPosition IS mutated by the consumer, so it still
+            // needs Volatile.Read to observe the latest published value.
+            long writePos = _header->WritePosition;
             long readPos = Volatile.Read(ref _header->ReadPosition);
 
             long available = CalculateAvailable(writePos, readPos);
@@ -199,8 +201,10 @@ namespace SharedMemory
             if (destination.Length == 0)
                 return 0;
 
+            // Symmetric to TryWrite: SPSC reader owns ReadPosition (plain load) and observes
+            // WritePosition published by the producer (Volatile.Read for acquire semantics).
             long writePos = Volatile.Read(ref _header->WritePosition);
-            long readPos = Volatile.Read(ref _header->ReadPosition);
+            long readPos = _header->ReadPosition;
 
             long used = CalculateUsed(writePos, readPos);
             if (used == 0)

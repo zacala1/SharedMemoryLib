@@ -540,6 +540,209 @@ public class ChangeVerificationTests
         Assert.That(buf.TryRead(dst), Is.GreaterThan(0));
     }
 
+    // ── #8 InitializeOrOpen race-safe two-phase magic ───────────────────────
+
+    [Test]
+    public void InitializeOrOpen_ConcurrentSameProcessOpen_NoTornCapacityRead()
+    {
+        // Spawn N threads that all try to open the same buffer simultaneously. Exactly one
+        // wins the init CAS and writes the header; the rest must observe the final state
+        // consistently — no "Capacity mismatch" exception from reading a half-initialized
+        // header (the bug the two-phase magic fix prevents).
+        const int Threads = 16;
+        string name = N("InitRace");
+        var options = new SharedMemoryBufferOptions { Capacity = 4096, CreateOrOpen = true };
+
+        var barrier = new Barrier(Threads);
+        var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
+        var buffers = new HighPerformanceSharedBuffer?[Threads];
+
+        Parallel.For(0, Threads, i =>
+        {
+            try
+            {
+                barrier.SignalAndWait();
+                buffers[i] = new HighPerformanceSharedBuffer(name, options);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(ex);
+            }
+        });
+
+        try
+        {
+            Assert.That(errors, Is.Empty,
+                "Concurrent open from same process must not throw — that would indicate a torn header read");
+
+            // Exactly one thread must report IsOwner=true (the CAS winner).
+            int ownerCount = 0;
+            foreach (var b in buffers)
+                if (b is not null && b.IsOwner) ownerCount++;
+            Assert.That(ownerCount, Is.EqualTo(1), "Exactly one CAS winner expected");
+
+            // All openers must see the same capacity (the one the winner wrote).
+            foreach (var b in buffers)
+                if (b is not null)
+                    Assert.That(b.Capacity, Is.EqualTo(4096));
+        }
+        finally
+        {
+            foreach (var b in buffers) b?.Dispose();
+        }
+    }
+
+    // ── #9 IVersionedSchema.IsCompatibleWith now consulted ──────────────────
+
+    [Test]
+    public void VersionedSchema_IsCompatibleWith_RejectionVetoesFullMode()
+    {
+        // Before the fix, IsCompatibleWith was declared on the interface but never invoked,
+        // so a schema could only express its policy via the SchemaCompatibility enum mode.
+        // Now: if the schema vetoes a version pair, the open must fail even under Full mode.
+        string name = N("VetoFull");
+
+        // Keep v1 alive — on Windows the named MMF is destroyed when the last handle closes,
+        // so a `using` block around just the writer would let the storage vanish before v2 opens.
+        using var v1 = new StrictSharedMemory<VetoSchemaV1>(name, default);
+        v1.Write(VetoSchemaV1.Value, 42);
+
+        // Open as v2 schema with Full mode — but v2.IsCompatibleWith(v1) returns false,
+        // so the open must throw despite Full mode being permissive at the enum level.
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            using var v2 = new StrictSharedMemory<VetoSchemaV2>(name, default,
+                create: false, SchemaCompatibility.Full);
+        }, "Schema-side veto via IsCompatibleWith must override permissive enum mode");
+    }
+
+    [Test]
+    public void VersionedSchema_IsCompatibleWith_AcceptanceAllowsFullMode()
+    {
+        // Mirror test: when the schema accepts, Full mode succeeds as before.
+        string name = N("VetoOk");
+
+        using var v1 = new StrictSharedMemory<VetoSchemaV1>(name, default);
+        v1.Write(VetoSchemaV1.Value, 7);
+
+        // VetoSchemaAccept always accepts via IsCompatibleWith — Full mode succeeds.
+        using var v2 = new StrictSharedMemory<VetoSchemaAccept>(name, default,
+            create: false, SchemaCompatibility.Full);
+        // Should not throw — IsCompatibleWith returned true, enum allows version drift.
+    }
+
+    public struct VetoSchemaV1 : IVersionedSchema
+    {
+        public const string Value = "Value";
+        public int Version => 1;
+        public bool IsCompatibleWith(int otherVersion) => otherVersion == 1;
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>(Value);
+        }
+    }
+
+    public struct VetoSchemaV2 : IVersionedSchema
+    {
+        public const string Value = "Value";
+        public int Version => 2;
+        // Explicit veto of v1 — this schema does NOT want to be opened over v1 storage,
+        // regardless of what the enum-level SchemaCompatibility mode allows.
+        public bool IsCompatibleWith(int otherVersion) => otherVersion == 2;
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>(Value);
+        }
+    }
+
+    public struct VetoSchemaAccept : IVersionedSchema
+    {
+        public const string Value = "Value";
+        public int Version => 2;
+        public bool IsCompatibleWith(int otherVersion) => true; // accept any version
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>(Value);
+        }
+    }
+
+    // ── #15 Cross-platform support smoke tests ───────────────────────────────
+
+    [Test]
+    public void CrossPlatform_ConstructionSucceeds_OnCurrentOS()
+    {
+        // The library now removes [SupportedOSPlatform("windows")] — construction must succeed
+        // on whatever OS the test runs on (Windows in CI here, Linux when shipped to users).
+        // Anything else means the platform-dispatch in Initialize() picked the wrong branch.
+        using var buf = new HighPerformanceSharedBuffer(N("XPlatCtor"),
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+        Assert.That(buf.IsOwner, Is.True);
+        Assert.That(buf.Capacity, Is.EqualTo(4096));
+    }
+
+    [Test]
+    public void CrossPlatform_FilePathMode_WorksOnAllSupportedOS()
+    {
+        // FilePath mode uses CreateFromFile with mapName=null on Linux and the kernel name
+        // on Windows — both paths must succeed. This is the portable escape hatch for users
+        // who want explicit on-disk backing.
+        string tmpPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            $"shmtest_{Guid.NewGuid():N}.bin");
+        try
+        {
+            using var buf = new HighPerformanceSharedBuffer(N("XPlatFile"),
+                new SharedMemoryBufferOptions { Capacity = 4096, FilePath = tmpPath });
+            var data = new byte[] { 1, 2, 3, 4 };
+            buf.Write(data, 0);
+            var back = new byte[4];
+            buf.Read(back, 0);
+            Assert.That(back, Is.EqualTo(data));
+        }
+        finally
+        {
+            try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
+        }
+    }
+
+    [Test]
+    public void CrossPlatform_NameWithLeadingSlash_NormalizedConsistently()
+    {
+        // POSIX shm conventions prefix names with '/'. We strip it so the same logical
+        // identifier resolves to the same backing region on both OSes — otherwise a Linux
+        // app using "/foo" would conflict with itself if a different caller used "foo".
+        string name = "/SlashTest_" + Guid.NewGuid().ToString("N");
+        using var buf = new HighPerformanceSharedBuffer(name,
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+        // Just confirming construction doesn't throw — the slash handling lives in
+        // SanitizeLinuxName on Linux and is a no-op on Windows (named MMF accepts slashes).
+        Assert.That(buf.Capacity, Is.EqualTo(4096));
+    }
+
+    [Test]
+    public void CrossPlatform_NameWithPathSeparator_RejectedOnLinuxAcceptedOnWindows()
+    {
+        // Defense-in-depth: "foo/bar" or "foo\\bar" would let a Linux caller escape /dev/shm.
+        // On Linux we must reject it. On Windows, MemoryMappedFile accepts these characters
+        // (subject to its own namespace rules), so we can't categorically reject — the test
+        // therefore branches on OS.
+        string bad = "Path/Sep_" + Guid.NewGuid().ToString("N");
+        if (OperatingSystem.IsLinux())
+        {
+            Assert.Throws<ArgumentException>(() =>
+            {
+                using var _ = new HighPerformanceSharedBuffer(bad,
+                    new SharedMemoryBufferOptions { Capacity = 4096 });
+            }, "Linux must reject path separators to prevent /dev/shm escape");
+        }
+        else
+        {
+            // On Windows, this is fine — kernel namespace handles separators.
+            using var buf = new HighPerformanceSharedBuffer(bad,
+                new SharedMemoryBufferOptions { Capacity = 4096 });
+            Assert.That(buf.Capacity, Is.EqualTo(4096));
+        }
+    }
+
     // ── Schemas & helpers ────────────────────────────────────────────────────
 
     private enum TestEnumInt  : int  { A = 1 }

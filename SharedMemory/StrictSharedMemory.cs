@@ -3,7 +3,6 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 
 namespace SharedMemory
@@ -12,8 +11,8 @@ namespace SharedMemory
     /// Strictly-typed shared memory with compile-time schema enforcement and versioning.
     /// All fields are declared upfront with fixed types, positions, and sizes.
     /// Provides zero-allocation access with full type safety.
+    /// Cross-platform via the underlying <see cref="HighPerformanceSharedBuffer"/> (Windows + Linux).
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public sealed class StrictSharedMemory<TSchema> : IDisposable where TSchema : struct, ISharedMemorySchema
     {
         private const int SchemaHeaderSize = 64; // Reserved for schema metadata
@@ -436,11 +435,14 @@ namespace SharedMemory
             if (data.Length > 0)
                 _buffer.Write(data, baseOffset + 4);
 
-            // Zero remaining space to prevent stale data leaking
+            // Zero remaining space to prevent stale data leaking. Use a larger stackalloc
+            // (1024 vs the previous 256) so a 4KB tail clears in 4 _buffer.Write calls instead
+            // of 16. 1024 matches MaxStackAllocBytes used elsewhere in this class and stays
+            // well within typical stack budgets — WriteBlob is not recursive.
             int remaining = metadata.ArrayLength - 4 - data.Length;
             if (remaining > 0)
             {
-                Span<byte> zeros = stackalloc byte[Math.Min(remaining, 256)];
+                Span<byte> zeros = stackalloc byte[Math.Min(remaining, MaxStackAllocBytes)];
                 zeros.Clear();
                 long offset = baseOffset + 4 + data.Length;
                 int left = remaining;
@@ -758,6 +760,18 @@ namespace SharedMemory
                     throw new InvalidOperationException(
                         $"Schema version mismatch: expected {SchemaVersion}, found {StoredSchemaVersion}. " +
                         $"Compatibility mode: {_compatibility}");
+                }
+
+                // Schema-side veto: if the schema itself can declare incompatibility for this
+                // specific pair (e.g., v3 schema knows it cannot safely read v1 even under Full mode),
+                // honor that. Previously IVersionedSchema.IsCompatibleWith was never invoked, leaving
+                // the interface contract unfulfilled — schemas could lie about compatibility and the
+                // library would still accept the open.
+                if (_schema is IVersionedSchema versioned && !versioned.IsCompatibleWith(StoredSchemaVersion))
+                {
+                    throw new InvalidOperationException(
+                        $"Schema rejected stored version {StoredSchemaVersion} via IsCompatibleWith " +
+                        $"(current schema version: {SchemaVersion})");
                 }
             }
 

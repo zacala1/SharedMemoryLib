@@ -6,7 +6,6 @@ using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -16,8 +15,12 @@ namespace SharedMemory
     /// <summary>
     /// High-performance shared memory buffer with zero-allocation APIs, SIMD optimizations,
     /// and lock-free synchronization. Designed for .NET 8+ with modern performance patterns.
+    ///
+    /// <para>Cross-platform: on Windows uses named MemoryMappedFile; on Linux uses a file in
+    /// <c>/dev/shm</c> (tmpfs) wrapped by <c>MemoryMappedFile.CreateFromFile</c>. Both paths
+    /// yield the same raw pointer after construction, so the hot path (Read/Write/locks/SIMD)
+    /// is byte-for-byte identical and there is no per-call OS dispatch.</para>
     /// </summary>
-    [SupportedOSPlatform("windows")]
     public sealed unsafe class HighPerformanceSharedBuffer : ISharedMemoryBuffer
     {
         private readonly string _name;
@@ -28,6 +31,11 @@ namespace SharedMemory
 
         private MemoryMappedFile? _mmf;
         private MemoryMappedViewAccessor? _accessor;
+        // On Linux, we may also hold a FileStream backing the /dev/shm file. The MMF takes
+        // ownership when leaveOpen=false (default), so we only track it for diagnostic purposes
+        // and to clean up the path on the owner's dispose if no other openers remain.
+        private FileStream? _backingFile;
+        private string? _backingFilePath;
         private byte* _basePtr;
 
         // Performance counters
@@ -46,7 +54,11 @@ namespace SharedMemory
         [StructLayout(LayoutKind.Explicit, Size = 128)]
         private struct SharedHeader
         {
-            public const uint MagicNumber = 0x48504D53; // "SMHP"
+            public const uint MagicNumber = 0x48504D53; // "SMHP" — initialization complete, header fully populated
+            // Intermediate value written by the winner of the init CAS before it has finished writing
+            // the rest of the header. Losers spin-wait until they see MagicNumber (not this value)
+            // before reading Capacity etc., preventing a torn read of half-initialized state.
+            public const uint MagicInitializing = 0x49504D53; // "SMPI"
             public const int Size = 128;
 
             // Cache line 0 (offsets 0–63): writer-side fields
@@ -126,8 +138,23 @@ namespace SharedMemory
 
             try
             {
-                if (string.IsNullOrEmpty(_options.FilePath))
+                if (!string.IsNullOrEmpty(_options.FilePath))
                 {
+                    // Explicit file-backed mode — works on Windows AND Linux. On Linux, mapName
+                    // (3rd arg) must be null; on Windows, a non-null mapName creates a kernel
+                    // namespace alias. To stay cross-platform we always pass null here, and
+                    // callers who need a Windows-only kernel name should use the named branch.
+                    string? mapName = OperatingSystem.IsWindows() ? _name : null;
+                    _mmf = MemoryMappedFile.CreateFromFile(
+                        _options.FilePath,
+                        FileMode.OpenOrCreate,
+                        mapName,
+                        totalSize,
+                        MemoryMappedFileAccess.ReadWrite);
+                }
+                else if (OperatingSystem.IsWindows())
+                {
+                    // Windows named global shared memory — fastest, kernel-managed namespace.
                     _mmf = MemoryMappedFile.CreateOrOpen(
                         _name,
                         totalSize,
@@ -135,17 +162,53 @@ namespace SharedMemory
                         MemoryMappedFileOptions.None,
                         HandleInheritability.None);
                 }
+                else if (OperatingSystem.IsLinux())
+                {
+                    // Linux: emulate Windows named MMF via a file under /dev/shm (tmpfs).
+                    // POSIX shm_open(3) internally creates the file in this same tmpfs, so the
+                    // resulting mapping is functionally and performance-wise identical, while
+                    // letting us reuse the cross-platform MemoryMappedFile.CreateFromFile API
+                    // (no P/Invoke, no glibc version assumptions, no arch-specific O_ flag
+                    // values). Hot path is unchanged — same raw pointer, same SIMD copies.
+                    _backingFilePath = "/dev/shm/" + SanitizeLinuxName(_name);
+                    _backingFile = new FileStream(_backingFilePath,
+                        FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+
+                    if (_backingFile.Length == 0)
+                    {
+                        // Fresh region — set the size up front. Subsequent openers will see
+                        // this length and skip the SetLength call below.
+                        _backingFile.SetLength(totalSize);
+                    }
+                    else if (_backingFile.Length != totalSize)
+                    {
+                        // Mirror the Windows behavior where capacity mismatch on open throws.
+                        long actualLen = _backingFile.Length;
+                        _backingFile.Dispose();
+                        _backingFile = null;
+                        throw new InvalidOperationException(
+                            $"Existing shared memory '{_backingFilePath}' has size {actualLen} but {totalSize} was requested. " +
+                            $"Either match the existing size or remove the file.");
+                    }
+
+                    _mmf = MemoryMappedFile.CreateFromFile(
+                        _backingFile,
+                        mapName: null, // Linux ignores/rejects non-null mapName
+                        totalSize,
+                        MemoryMappedFileAccess.ReadWrite,
+                        HandleInheritability.None,
+                        leaveOpen: false); // MMF takes ownership of the FileStream
+                    _backingFile = null; // ownership transferred — don't double-dispose
+                }
                 else
                 {
-                    _mmf = MemoryMappedFile.CreateFromFile(
-                        _options.FilePath,
-                        FileMode.OpenOrCreate,
-                        _name,
-                        totalSize,
-                        MemoryMappedFileAccess.ReadWrite);
+                    throw new PlatformNotSupportedException(
+                        "HighPerformanceSharedBuffer requires Windows or Linux. " +
+                        "macOS/other POSIX is not currently supported in the anonymous-named mode; " +
+                        "set SharedMemoryBufferOptions.FilePath to use file-backed mode instead.");
                 }
 
-                _accessor = _mmf.CreateViewAccessor(0, totalSize, MemoryMappedFileAccess.ReadWrite);
+                _accessor = _mmf!.CreateViewAccessor(0, totalSize, MemoryMappedFileAccess.ReadWrite);
                 _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePtr);
 
                 if (_basePtr == null)
@@ -159,11 +222,39 @@ namespace SharedMemory
             }
         }
 
+        /// <summary>
+        /// Normalizes a buffer name into a safe filename for /dev/shm. Strips leading slashes
+        /// (POSIX shm names start with '/'; we want a flat filename) and rejects characters
+        /// that would walk out of the tmpfs directory.
+        /// </summary>
+        private static string SanitizeLinuxName(string name)
+        {
+            string trimmed = name.TrimStart('/');
+            if (trimmed.Length == 0)
+                throw new ArgumentException("Name resolves to empty after trimming slashes", nameof(name));
+            // Disallow path separators and '..' fragments — keeps the file pinned to /dev/shm.
+            if (trimmed.Contains('/') || trimmed.Contains('\\') || trimmed == "." || trimmed == "..")
+                throw new ArgumentException(
+                    $"Name '{name}' contains path separators or traversal fragments; " +
+                    $"use a flat identifier for cross-platform compatibility.",
+                    nameof(name));
+            return trimmed;
+        }
+
         private bool InitializeOrOpen()
         {
             var header = (SharedHeader*)_basePtr;
 
-            if (Interlocked.CompareExchange(ref header->Magic, SharedHeader.MagicNumber, 0) == 0)
+            // Two-phase init to make cross-process concurrent open race-safe:
+            //   Phase 1: CAS Magic 0 → Initializing. Winner gets exclusive init rights.
+            //   Phase 2: Winner writes all header fields, then promotes Magic to MagicNumber
+            //            via a release-store. Losers spin until they observe MagicNumber and
+            //            only then read the rest of the header, guaranteeing they never see
+            //            partially-initialized state (the previous code could read Magic=
+            //            MagicNumber but Capacity=0, falsely triggering a capacity mismatch).
+            uint prev = Interlocked.CompareExchange(ref header->Magic, SharedHeader.MagicInitializing, 0);
+
+            if (prev == 0)
             {
                 header->Version = 2; // Version 2 with extended header
                 header->Capacity = _capacity;
@@ -176,11 +267,28 @@ namespace SharedMemory
                 header->DataChecksum = 0;
 
                 Thread.MemoryBarrier();
+
+                // Release-store: makes all prior header writes visible before any reader sees MagicNumber.
+                Volatile.Write(ref header->Magic, SharedHeader.MagicNumber);
                 return true;
             }
 
-            if (header->Magic != SharedHeader.MagicNumber)
-                throw new InvalidDataException("Invalid shared memory header");
+            // Loser path: wait for winner to publish the final magic value. Bounded spin —
+            // initialization is normally microseconds, so even a generous timeout is fine.
+            var sw = Stopwatch.StartNew();
+            uint observed;
+            while (true)
+            {
+                observed = Volatile.Read(ref header->Magic);
+                if (observed == SharedHeader.MagicNumber) break;
+                if (observed != SharedHeader.MagicInitializing)
+                    throw new InvalidDataException(
+                        $"Invalid shared memory header (magic=0x{observed:X8})");
+                if (sw.Elapsed > TimeSpan.FromSeconds(5))
+                    throw new TimeoutException(
+                        "Timed out waiting for shared memory to be initialized by another process");
+                Thread.SpinWait(100);
+            }
 
             if (header->Capacity != _capacity)
                 throw new InvalidOperationException(
@@ -745,6 +853,36 @@ namespace SharedMemory
             catch (Exception ex)
             {
                 _logger?.LogWarning(ex, "Failed to dispose memory-mapped file during cleanup");
+            }
+
+            try
+            {
+                // Only set if the MMF didn't take ownership (i.e., construction aborted partway).
+                _backingFile?.Dispose();
+                _backingFile = null;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Failed to dispose backing file during cleanup");
+            }
+
+            // /dev/shm files persist past process death (unlike Windows MMF which auto-cleans
+            // when the last handle closes). Best-effort: the creator unlinks on dispose. This
+            // is racy with other openers — if anyone is still using the region, they keep the
+            // mapping alive via their own fd, but future opens-by-name will fail. We log and
+            // continue rather than crash, since cleanup is best-effort by design.
+            if (_isOwner && _backingFilePath != null)
+            {
+                try
+                {
+                    if (File.Exists(_backingFilePath))
+                        File.Delete(_backingFilePath);
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' on owner dispose", _backingFilePath);
+                }
+                _backingFilePath = null;
             }
         }
 

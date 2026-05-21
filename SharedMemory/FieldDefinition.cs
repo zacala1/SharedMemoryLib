@@ -204,8 +204,16 @@ namespace SharedMemory
 
         internal static SharedTypeCode GetTypeCode<T>() where T : unmanaged
         {
-            var type = typeof(T);
+            // Fast path for generic callers: TypeCodeCache<T> is JIT-specialized so .Value is
+            // just a static field load (no dictionary, no typeof, no isinst checks). Falls back
+            // to the slow path below if .Value hasn't been initialized yet (cctor handles it).
+            return TypeCodeCache<T>.Value;
+        }
 
+        // Slow path: used at class initialization of TypeCodeCache<T>, plus available for callers
+        // that have a runtime Type (very rare in this codebase).
+        private static SharedTypeCode ResolveTypeCode(Type type)
+        {
             if (s_typeCodes.TryGetValue(type, out var code))
                 return code;
 
@@ -221,6 +229,17 @@ namespace SharedMemory
                 return SharedTypeCode.Struct;
 
             return SharedTypeCode.Unknown;
+        }
+
+        /// <summary>
+        /// Per-T type-code cache. The CLR creates one specialization per generic T,
+        /// so <c>Value</c> is computed exactly once for each T the program ever uses
+        /// and subsequently accessed as a static field load — typically 1-2 cycles vs.
+        /// the dictionary lookup that <see cref="GetTypeCode{T}"/> used to do on every call.
+        /// </summary>
+        private static class TypeCodeCache<T> where T : unmanaged
+        {
+            internal static readonly SharedTypeCode Value = ResolveTypeCode(typeof(T));
         }
     }
 }
