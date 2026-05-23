@@ -743,6 +743,137 @@ public class ChangeVerificationTests
         }
     }
 
+    // ── BUG-A: Constructor cleans up if InitializeOrOpen throws ──────────────
+
+    [Test]
+    public void BugA_CapacityMismatch_ConstructorDoesNotLeakResources()
+    {
+        // Craft a backing file whose header advertises Capacity=4096, then attempt to open it
+        // with a 8192 request. Initialize() succeeds (MMF + accessor + pointer all live), then
+        // InitializeOrOpen detects the capacity mismatch and throws — exercising the exact
+        // post-Initialize failure window BUG-A protects against.
+        //
+        // Verification: after the throw, File.Delete must succeed. On Windows, an MMF that
+        // wasn't disposed holds an exclusive FileStream lock and Delete throws IOException
+        // ("file in use"). If BUG-A had not added the catch+Cleanup, the file would still be
+        // locked by the leaked accessor until GC eventually finalized it — non-deterministic
+        // and easy to miss. File.Delete is the cleanest possible "no handles left open" probe.
+        string tmpPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            $"shmtest_BugA_{Guid.NewGuid():N}.bin");
+        string name = N("BugA_HeaderMismatch");
+        const int existingCapacity = 4096;
+        const int headerSize = 128;
+        try
+        {
+            // Synthetic header: Magic + Version + Capacity, the three fields InitializeOrOpen
+            // reads on the "open existing" branch. Everything else stays zero.
+            byte[] file = new byte[headerSize + existingCapacity];
+            BitConverter.TryWriteBytes(file.AsSpan(0), 0x48504D53u); // MagicNumber "SMHP"
+            BitConverter.TryWriteBytes(file.AsSpan(4), 2u);          // Version
+            BitConverter.TryWriteBytes(file.AsSpan(8), (long)existingCapacity);
+            System.IO.File.WriteAllBytes(tmpPath, file);
+
+            // Mismatch open: 8192 ≠ 4096 stored in header → InitializeOrOpen throws AFTER
+            // Initialize() returned successfully. This is the BUG-A code path.
+            Assert.Throws<InvalidOperationException>(() =>
+            {
+                using var _ = new HighPerformanceSharedBuffer(name,
+                    new SharedMemoryBufferOptions { Capacity = 8192, FilePath = tmpPath });
+            });
+
+            // Probe: file must be deletable, i.e., no leaked handle.
+            Assert.DoesNotThrow(() => System.IO.File.Delete(tmpPath),
+                "Failed constructor leaked the MMF/accessor — file still locked after throw");
+        }
+        finally
+        {
+            try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
+        }
+    }
+
+    // ── STABILITY-B: Name sanitization rejects hostile inputs ────────────────
+
+    [Test]
+    public void StabilityB_NameWithNulCharacter_Rejected()
+    {
+        // NUL would silently truncate the /dev/shm path on Linux, letting a caller alias an
+        // unrelated region under "foo" when they thought they were creating "foo\0secret".
+        // Windows MMF accepts NUL but the same logical risk exists, so we reject everywhere
+        // — the cross-platform name surface needs to be the strictest of all targets.
+        if (!OperatingSystem.IsLinux()) Assert.Pass("Sanitizer only invoked on Linux");
+        Assert.Throws<ArgumentException>(() =>
+        {
+            using var _ = new HighPerformanceSharedBuffer("foo\0bar",
+                new SharedMemoryBufferOptions { Capacity = 4096 });
+        });
+    }
+
+    [Test]
+    public void StabilityB_NameWithControlCharacter_Rejected()
+    {
+        if (!OperatingSystem.IsLinux()) Assert.Pass("Sanitizer only invoked on Linux");
+        Assert.Throws<ArgumentException>(() =>
+        {
+            using var _ = new HighPerformanceSharedBuffer("foo\nbar",
+                new SharedMemoryBufferOptions { Capacity = 4096 });
+        });
+    }
+
+    [Test]
+    public void StabilityB_NameExceedingNameMax_Rejected()
+    {
+        // Linux NAME_MAX is 255 bytes (not chars). A 300-char ASCII name = 300 bytes UTF-8 ⇒
+        // ENAMETOOLONG from FileStream. We want a clear ArgumentException at the API surface
+        // before any filesystem call.
+        if (!OperatingSystem.IsLinux()) Assert.Pass("Sanitizer only invoked on Linux");
+        string longName = new string('a', 300);
+        Assert.Throws<ArgumentException>(() =>
+        {
+            using var _ = new HighPerformanceSharedBuffer(longName,
+                new SharedMemoryBufferOptions { Capacity = 4096 });
+        });
+    }
+
+    [Test]
+    public void StabilityB_NameWithEmojis_AcceptedIfUnder255Bytes()
+    {
+        // UTF-8 multi-byte chars should be accepted as long as total stays under NAME_MAX —
+        // documenting the byte-not-char semantics matters because callers may pre-size assuming chars.
+        string name = "테스트_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        using var buf = new HighPerformanceSharedBuffer(name,
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+        Assert.That(buf.Capacity, Is.EqualTo(4096));
+    }
+
+    // ── STABILITY-A: PID reuse field is written and respected ────────────────
+
+    [Test]
+    public void StabilityA_LockOwnerInfo_IncludesProcessStartTime()
+    {
+        // Indirect test of STABILITY-A: after acquiring the write lock, the header's
+        // LockOwnerProcessStartTime field should be non-zero (assuming StartTime is readable on
+        // this host). We probe through the public GetLockOwnerInfo + the orphan-check pathway,
+        // which both depend on the start-time being captured at acquire.
+        using var buf = new HighPerformanceSharedBuffer(N("StabilityA"),
+            new SharedMemoryBufferOptions
+            {
+                Capacity = 4096,
+                EnableOrphanLockDetection = true,
+                OrphanLockTimeout = TimeSpan.FromSeconds(30)
+            });
+
+        Assert.That(buf.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+        try
+        {
+            var info = buf.GetLockOwnerInfo();
+            Assert.That(info.ProcessId, Is.EqualTo(Environment.ProcessId));
+            // Orphan check should return false since WE are alive AND our StartTime matches the
+            // captured one — verifies the comparison path doesn't false-positive ourselves.
+            Assert.That(info.IsOrphan, Is.False, "Our own held lock must not be detected as orphan");
+        }
+        finally { buf.ReleaseWriteLock(); }
+    }
+
     // ── Schemas & helpers ────────────────────────────────────────────────────
 
     private enum TestEnumInt  : int  { A = 1 }

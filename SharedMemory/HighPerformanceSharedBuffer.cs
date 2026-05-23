@@ -36,6 +36,10 @@ namespace SharedMemory
         // and to clean up the path on the owner's dispose if no other openers remain.
         private FileStream? _backingFile;
         private string? _backingFilePath;
+        // Set true if we freshly created (or were the first to set the size of) the /dev/shm
+        // file on Linux. Lets Cleanup unlink the file when construction fails partway through —
+        // otherwise a half-sized file would persist in tmpfs and corrupt the next open.
+        private bool _createdBackingFile;
         private byte* _basePtr;
 
         // Performance counters
@@ -45,6 +49,26 @@ namespace SharedMemory
         private long _totalBytesWritten;
 
         private volatile int _disposed;
+
+        // Cached once per process: stamped into the header at lock acquire so an orphan check
+        // can distinguish "same PID, same process" from "same PID, recycled by the OS for an
+        // unrelated process". Process.StartTime can throw under restricted permissions (Linux
+        // containers without /proc, certain Windows ACLs) — in that case we store 0 and the
+        // orphan check silently falls back to PID-only matching.
+        private static readonly long s_processStartTimeBinary = TryCaptureProcessStartTime();
+
+        private static long TryCaptureProcessStartTime()
+        {
+            try
+            {
+                using var p = Process.GetCurrentProcess();
+                return p.StartTime.ToBinary();
+            }
+            catch
+            {
+                return 0;
+            }
+        }
 
         /// <summary>
         /// Extended header structure with orphan lock detection support.
@@ -70,7 +94,15 @@ namespace SharedMemory
             [FieldOffset(28)] public int LockOwnerProcessId;
             [FieldOffset(32)] public long LockOwnerThreadId;
             [FieldOffset(40)] public long LockAcquiredTimestamp;
-            // bytes 48–63: implicit padding
+            // PID reuse defense: if a lock-holding process dies and the OS recycles its PID for an
+            // unrelated process, GetProcessById would find the new process alive and skip orphan
+            // recovery — leaving the lock permanently held. By recording the owner's Process.StartTime
+            // at acquire and comparing on the orphan check, we detect the impostor. Stored as
+            // DateTime.ToBinary() (signed long). Value 0 means "not recorded" — older binaries that
+            // didn't write it, or hosts where StartTime is unreadable (permission denied); in that
+            // case orphan detection falls back to the PID-only check, preserving prior behavior.
+            [FieldOffset(48)] public long LockOwnerProcessStartTime;
+            // bytes 56–63: implicit padding
 
             // Cache line 1 (offsets 64–127): reader-side fields and checksum metadata
             [FieldOffset(64)] public int ReaderCount;           // accessed via Interlocked/Volatile
@@ -127,7 +159,20 @@ namespace SharedMemory
             _logger?.LogDebug("Creating shared buffer '{Name}' with capacity {Capacity}", name, _capacity);
 
             Initialize();
-            _isOwner = InitializeOrOpen();
+            try
+            {
+                // InitializeOrOpen can throw (capacity mismatch, invalid magic, init timeout).
+                // Initialize() has its own try/catch+Cleanup, but once it returns successfully
+                // the MMF/accessor/pointer (and on Linux, the /dev/shm file) are live and would
+                // leak until finalization if we let the constructor throw uncaught. Mirror the
+                // Initialize() catch here so the failure mode is deterministic.
+                _isOwner = InitializeOrOpen();
+            }
+            catch
+            {
+                Cleanup();
+                throw;
+            }
 
             _logger?.LogInformation("Shared buffer '{Name}' initialized. IsOwner: {IsOwner}", name, _isOwner);
         }
@@ -177,7 +222,11 @@ namespace SharedMemory
                     if (_backingFile.Length == 0)
                     {
                         // Fresh region — set the size up front. Subsequent openers will see
-                        // this length and skip the SetLength call below.
+                        // this length and skip the SetLength call below. Mark that WE were the
+                        // process to size this file: if construction fails between here and
+                        // AcquirePointer, Cleanup will unlink the file so the next caller
+                        // doesn't trip over a half-initialized blob.
+                        _createdBackingFile = true;
                         _backingFile.SetLength(totalSize);
                     }
                     else if (_backingFile.Length != totalSize)
@@ -225,19 +274,50 @@ namespace SharedMemory
         /// <summary>
         /// Normalizes a buffer name into a safe filename for /dev/shm. Strips leading slashes
         /// (POSIX shm names start with '/'; we want a flat filename) and rejects characters
-        /// that would walk out of the tmpfs directory.
+        /// that would walk out of the tmpfs directory or produce a name that POSIX cannot
+        /// faithfully represent.
         /// </summary>
         private static string SanitizeLinuxName(string name)
         {
             string trimmed = name.TrimStart('/');
             if (trimmed.Length == 0)
                 throw new ArgumentException("Name resolves to empty after trimming slashes", nameof(name));
-            // Disallow path separators and '..' fragments — keeps the file pinned to /dev/shm.
+
+            // Path traversal — keeps the file pinned to /dev/shm.
             if (trimmed.Contains('/') || trimmed.Contains('\\') || trimmed == "." || trimmed == "..")
                 throw new ArgumentException(
                     $"Name '{name}' contains path separators or traversal fragments; " +
                     $"use a flat identifier for cross-platform compatibility.",
                     nameof(name));
+
+            // NUL is silently truncated by every POSIX filesystem call — a name like "foo\0bar"
+            // would resolve to "foo" and let a caller alias an unrelated region. Reject explicitly.
+            if (trimmed.Contains('\0'))
+                throw new ArgumentException(
+                    $"Name '{name}' contains a NUL character, which POSIX would truncate at.",
+                    nameof(name));
+
+            // Control chars (newline, tab, BEL, etc.) make the file unmanageable from shell tools
+            // and may confuse logging pipelines that consume the path verbatim. Cheap to reject.
+            foreach (char c in trimmed)
+            {
+                if (char.IsControl(c))
+                    throw new ArgumentException(
+                        $"Name '{name}' contains a control character (U+{(int)c:X4}); use printable ASCII.",
+                        nameof(name));
+            }
+
+            // Linux NAME_MAX is 255 bytes (not chars). UTF-8 expansion of CJK / emoji means a name
+            // that looks short in C# can still bust the limit at the filesystem level — better to
+            // catch it here with a clear message than to surface as ENAMETOOLONG (E2BIG-like) deep
+            // in FileStream construction.
+            const int NameMax = 255;
+            int utf8Len = System.Text.Encoding.UTF8.GetByteCount(trimmed);
+            if (utf8Len > NameMax)
+                throw new ArgumentException(
+                    $"Name '{name}' is {utf8Len} bytes in UTF-8, exceeding the tmpfs NAME_MAX limit of {NameMax}.",
+                    nameof(name));
+
             return trimmed;
         }
 
@@ -499,9 +579,11 @@ namespace SharedMemory
                     bool success = false;
                     try
                     {
-                        // Record lock ownership for orphan detection
+                        // Record lock ownership for orphan detection. StartTime defeats PID-reuse
+                        // attacks on the orphan check (see IsWriteLockOrphaned).
                         header->LockOwnerProcessId = Environment.ProcessId;
                         header->LockOwnerThreadId = Environment.CurrentManagedThreadId;
+                        header->LockOwnerProcessStartTime = s_processStartTimeBinary;
                         header->LockAcquiredTimestamp = Stopwatch.GetTimestamp();
                         Thread.MemoryBarrier();
 
@@ -527,6 +609,7 @@ namespace SharedMemory
                             // Clear ownership and release on failure
                             header->LockOwnerProcessId = 0;
                             header->LockOwnerThreadId = 0;
+                            header->LockOwnerProcessStartTime = 0;
                             header->LockAcquiredTimestamp = 0;
                             Interlocked.Exchange(ref header->WriterLockState, 0);
                         }
@@ -571,6 +654,7 @@ namespace SharedMemory
             // Clear ownership info
             header->LockOwnerProcessId = 0;
             header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
             header->LockAcquiredTimestamp = 0;
 
             Thread.MemoryBarrier();
@@ -651,6 +735,31 @@ namespace SharedMemory
                 using var process = Process.GetProcessById(ownerPid);
                 if (process.HasExited)
                     return true;
+
+                // PID-reuse defense: even when a process with this PID exists, it might be an
+                // unrelated process that the OS recycled the PID for after the real owner died.
+                // Compare the captured StartTime; mismatch ⇒ impostor ⇒ orphan.
+                long storedStartTime = header->LockOwnerProcessStartTime;
+                if (storedStartTime != 0)
+                {
+                    try
+                    {
+                        long currentStartTime = process.StartTime.ToBinary();
+                        if (currentStartTime != storedStartTime)
+                        {
+                            _logger?.LogWarning(
+                                "Lock owner PID {Pid} still exists but its StartTime differs (orphan from PID reuse)",
+                                ownerPid);
+                            return true;
+                        }
+                    }
+                    catch
+                    {
+                        // StartTime can throw under restricted permissions (e.g., Linux container
+                        // without /proc, Windows ACL). Fall through to timestamp-based detection
+                        // — degraded but no worse than pre-feature behavior.
+                    }
+                }
             }
             catch (ArgumentException)
             {
@@ -707,6 +816,7 @@ namespace SharedMemory
             _logger?.LogWarning("Force releasing orphan lock from process {ProcessId}", orphanPid);
 
             header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
             header->LockAcquiredTimestamp = 0;
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
@@ -867,23 +977,29 @@ namespace SharedMemory
             }
 
             // /dev/shm files persist past process death (unlike Windows MMF which auto-cleans
-            // when the last handle closes). Best-effort: the creator unlinks on dispose. This
-            // is racy with other openers — if anyone is still using the region, they keep the
-            // mapping alive via their own fd, but future opens-by-name will fail. We log and
-            // continue rather than crash, since cleanup is best-effort by design.
-            if (_isOwner && _backingFilePath != null)
+            // when the last handle closes). Two cases where we unlink:
+            //   1. We're the application-level owner (won the magic CAS) — clean shutdown.
+            //   2. We sized the file but never finished construction (_createdBackingFile && _basePtr==null
+            //      at this point because we already nulled it above). A half-initialized file
+            //      would cause the next open to throw "Capacity mismatch" or worse if the size
+            //      ended up partial. Better to unlink and let the next caller re-create.
+            // Both are best-effort: if another process is using the region, its open fd keeps
+            // the inode alive on Linux, so we only remove the directory entry.
+            bool shouldUnlink = _backingFilePath != null && (_isOwner || _createdBackingFile);
+            if (shouldUnlink)
             {
                 try
                 {
-                    if (File.Exists(_backingFilePath))
-                        File.Delete(_backingFilePath);
+                    if (File.Exists(_backingFilePath!))
+                        File.Delete(_backingFilePath!);
                 }
                 catch (Exception ex)
                 {
-                    _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' on owner dispose", _backingFilePath);
+                    _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' during cleanup", _backingFilePath);
                 }
-                _backingFilePath = null;
             }
+            _backingFilePath = null;
+            _createdBackingFile = false;
         }
 
         /// <summary>
