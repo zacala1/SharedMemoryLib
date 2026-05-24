@@ -66,6 +66,11 @@ namespace SharedMemory
 
         private volatile int _disposed;
         private readonly int _maxSpins;
+        // When false, the per-call Interlocked.Increment on TotalWrites/TotalReads/SpinExhausted*
+        // counters in shared-memory header is skipped. Each of those is a cross-process
+        // contention point — disabling can recover meaningful throughput in MPMC scenarios with
+        // many concurrent producers/consumers where stats are observed externally.
+        private readonly bool _statsEnabled;
 
         /// <summary>
         /// Gets the number of slots in the buffer
@@ -127,9 +132,15 @@ namespace SharedMemory
         /// Default 100 works well for typical workloads; increase for higher contention,
         /// decrease (e.g. 10) for latency-sensitive scenarios that prefer fast failure.
         /// </param>
+        /// <param name="enableStatistics">
+        /// When true (default), maintains TotalWrites/TotalReads/FailedWrites/FailedReads/
+        /// SpinExhausted* counters in the shared header via Interlocked. Set false for
+        /// high-concurrency workloads where stats are tracked externally — eliminates the
+        /// per-call atomic on a shared cache line (the dominant cost in many-producer scenarios).
+        /// </param>
         /// <exception cref="ArgumentException">Thrown when name is empty</exception>
         /// <exception cref="ArgumentOutOfRangeException">Thrown when slotCount/slotSize is invalid, maxSpins is not positive, or total size exceeds int.MaxValue</exception>
-        public MpmcCircularBuffer(string name, int slotCount, int slotSize, bool create = true, int maxSpins = 100)
+        public MpmcCircularBuffer(string name, int slotCount, int slotSize, bool create = true, int maxSpins = 100, bool enableStatistics = true)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty", nameof(name));
@@ -141,6 +152,7 @@ namespace SharedMemory
                 throw new ArgumentOutOfRangeException(nameof(maxSpins), "maxSpins must be positive");
 
             _maxSpins = maxSpins;
+            _statsEnabled = enableStatistics;
             _slotCount = RoundUpToPowerOf2(slotCount);
             _slotSize = slotSize;
             _slotTotalSize = _slotSize;
@@ -261,7 +273,7 @@ namespace SharedMemory
 
                         // Release the slot for reading (Volatile.Write has release semantics)
                         Volatile.Write(ref slot->Sequence, currentWrite + 1);
-                        Interlocked.Increment(ref _header->TotalWrites);
+                        if (_statsEnabled) Interlocked.Increment(ref _header->TotalWrites);
 
                         return true;
                     }
@@ -270,7 +282,7 @@ namespace SharedMemory
                 else if (diff < 0)
                 {
                     // Buffer is full
-                    Interlocked.Increment(ref _header->FailedWrites);
+                    if (_statsEnabled) Interlocked.Increment(ref _header->FailedWrites);
                     return false;
                 }
 
@@ -281,7 +293,7 @@ namespace SharedMemory
 
             // Exhausted maxSpins waiting for a slot that another writer was preparing —
             // not a "buffer full" condition. Track separately so diagnostics aren't muddied.
-            Interlocked.Increment(ref _header->SpinExhaustedWrites);
+            if (_statsEnabled) Interlocked.Increment(ref _header->SpinExhaustedWrites);
             return false;
         }
 
@@ -341,7 +353,7 @@ namespace SharedMemory
 
                         // Release the slot for writing (Volatile.Write has release semantics)
                         Volatile.Write(ref slot->Sequence, currentRead + _slotCount);
-                        Interlocked.Increment(ref _header->TotalReads);
+                        if (_statsEnabled) Interlocked.Increment(ref _header->TotalReads);
 
                         return peekLength;
                     }
@@ -350,7 +362,7 @@ namespace SharedMemory
                 else if (diff < 0)
                 {
                     // Buffer is empty
-                    Interlocked.Increment(ref _header->FailedReads);
+                    if (_statsEnabled) Interlocked.Increment(ref _header->FailedReads);
                     return 0;
                 }
 
@@ -361,7 +373,7 @@ namespace SharedMemory
 
             // Exhausted maxSpins waiting for a slot that another reader was preparing —
             // not a "buffer empty" condition. Track separately so diagnostics aren't muddied.
-            Interlocked.Increment(ref _header->SpinExhaustedReads);
+            if (_statsEnabled) Interlocked.Increment(ref _header->SpinExhaustedReads);
             return 0;
         }
 

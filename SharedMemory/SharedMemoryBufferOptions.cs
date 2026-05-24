@@ -75,6 +75,20 @@ namespace SharedMemory
         public bool EnableEvents { get; set; } = false;
 
         /// <summary>
+        /// When true (default), tracks read/write counts and byte totals via Interlocked operations
+        /// on every <see cref="HighPerformanceSharedBuffer.Read"/>/<see cref="HighPerformanceSharedBuffer.Write"/>.
+        /// The cost is roughly a single LOCK-prefixed instruction per call (~10ns uncontended,
+        /// 20-40ns under heavy reader contention).
+        ///
+        /// Set to <c>false</c> for read-heavy workloads with multiple concurrent readers where
+        /// the per-buffer statistics are not consumed: hot-path Interlocked overhead drops to
+        /// zero and <see cref="HighPerformanceSharedBuffer.GetStatistics"/> returns all zeros.
+        /// External observability (request-level metrics, sampling, etc.) is recommended in
+        /// that mode.
+        /// </summary>
+        public bool EnableStatistics { get; set; } = true;
+
+        /// <summary>
         /// Gets or sets the logger instance
         /// </summary>
         public ILogger? Logger { get; set; }

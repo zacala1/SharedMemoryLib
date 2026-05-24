@@ -874,6 +874,108 @@ public class ChangeVerificationTests
         finally { buf.ReleaseWriteLock(); }
     }
 
+    // ── OPT-7: EnableStatistics opt-in ───────────────────────────────────────
+
+    [Test]
+    public void Opt7_StatsDisabled_GetStatisticsReturnsZero()
+    {
+        // When stats are off, the hot-path Interlocked updates are skipped entirely.
+        // GetStatistics must reflect that — the counters were never incremented, so all
+        // four fields read zero even after real reads and writes.
+        using var buf = new HighPerformanceSharedBuffer(N("Opt7_Off"),
+            new SharedMemoryBufferOptions { Capacity = 4096, EnableStatistics = false });
+
+        var data = new byte[] { 1, 2, 3, 4 };
+        buf.Write(data, 0);
+        var back = new byte[4];
+        buf.Read(back, 0);
+
+        var (reads, writes, bytesRead, bytesWritten) = buf.GetStatistics();
+        Assert.That(reads, Is.EqualTo(0));
+        Assert.That(writes, Is.EqualTo(0));
+        Assert.That(bytesRead, Is.EqualTo(0));
+        Assert.That(bytesWritten, Is.EqualTo(0));
+    }
+
+    [Test]
+    public void Opt7_StatsEnabledByDefault_PreservesBackCompat()
+    {
+        // No explicit option ⇒ statistics tracked. Critical: external callers that consumed
+        // GetStatistics before OPT-7 must keep seeing accurate numbers.
+        using var buf = new HighPerformanceSharedBuffer(N("Opt7_OnDefault"),
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+
+        buf.Write(new byte[10], 0);
+        buf.Write(new byte[20], 10);
+        buf.Read(new byte[5], 0);
+
+        var (reads, writes, bytesRead, bytesWritten) = buf.GetStatistics();
+        Assert.That(writes, Is.EqualTo(2));
+        Assert.That(reads, Is.EqualTo(1));
+        Assert.That(bytesWritten, Is.EqualTo(30));
+        Assert.That(bytesRead, Is.EqualTo(5));
+    }
+
+    [Test]
+    public void Opt7_Mpmc_StatsDisabled_HeaderCountersStayZero()
+    {
+        // MPMC counters live in shared memory — disabling must keep them zero AND the buffer
+        // must still function correctly without them.
+        using var buf = new MpmcCircularBuffer(N("Opt7_Mpmc"),
+            slotCount: 16, slotSize: 128, create: true, maxSpins: 100, enableStatistics: false);
+
+        var msg = new byte[] { 9, 8, 7 };
+        Assert.That(buf.TryWrite(msg), Is.True);
+        var dst = new byte[8];
+        Assert.That(buf.TryRead(dst), Is.EqualTo(3));
+
+        var (totalWrites, totalReads, _, _) = buf.GetStatistics();
+        Assert.That(totalWrites, Is.EqualTo(0));
+        Assert.That(totalReads, Is.EqualTo(0));
+    }
+
+    // ── OPT-8: Optimistic reader-lock contention test ────────────────────────
+
+    [Test]
+    public void Opt8_OptimisticReaderLock_ManyReadersAllSucceed()
+    {
+        // Spawn N readers acquiring the lock simultaneously. The optimistic-increment design
+        // must let every reader claim without CAS-loop spinning against each other (the old
+        // design had each reader retry until its CAS landed). We assert all readers eventually
+        // succeed AND the ReaderCount returns to zero — proving rollback paths balance.
+        using var buf = new HighPerformanceSharedBuffer(N("Opt8_Readers"),
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+
+        const int readerCount = 32;
+        const int iterations = 50;
+        var successCount = 0;
+        var threads = new System.Threading.Thread[readerCount];
+        for (int i = 0; i < readerCount; i++)
+        {
+            threads[i] = new System.Threading.Thread(() =>
+            {
+                for (int j = 0; j < iterations; j++)
+                {
+                    if (buf.TryAcquireReadLock(TimeSpan.FromSeconds(2)))
+                    {
+                        try { System.Threading.Interlocked.Increment(ref successCount); }
+                        finally { buf.ReleaseReadLock(); }
+                    }
+                }
+            });
+        }
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) t.Join();
+
+        Assert.That(successCount, Is.EqualTo(readerCount * iterations),
+            "Every reader acquire attempt must succeed (no writer present)");
+
+        // Probe via brief write-lock — succeeds iff ReaderCount==0 (no leaked refs).
+        Assert.That(buf.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True,
+            "Writer must be able to acquire — leaked reader refs would block this");
+        buf.ReleaseWriteLock();
+    }
+
     // ── Schemas & helpers ────────────────────────────────────────────────────
 
     private enum TestEnumInt  : int  { A = 1 }
