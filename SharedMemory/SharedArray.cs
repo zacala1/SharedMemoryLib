@@ -94,7 +94,11 @@ namespace SharedMemory
         public void CopyTo(int startIndex, Span<T> destination)
         {
             ThrowIfDisposed();
-            if ((uint)startIndex + (uint)destination.Length > (uint)_length)
+            // Use long arithmetic for the bound check: (uint)+(uint) wraps mod 2^32, so a
+            // hostile/buggy startIndex≈2 000 000 000 with a comparable length would silently
+            // pass the test and then read past the array. Span.Length is non-negative by
+            // contract, but startIndex isn't, so we explicitly reject negatives first.
+            if (startIndex < 0 || (long)startIndex + destination.Length > _length)
                 throw new ArgumentOutOfRangeException(nameof(startIndex));
 
             var byteSpan = MemoryMarshal.AsBytes(destination);
@@ -112,7 +116,8 @@ namespace SharedMemory
         public void CopyFrom(int startIndex, ReadOnlySpan<T> source)
         {
             ThrowIfDisposed();
-            if ((uint)startIndex + (uint)source.Length > (uint)_length)
+            // Long arithmetic — see CopyTo for the same overflow rationale.
+            if (startIndex < 0 || (long)startIndex + source.Length > _length)
                 throw new ArgumentOutOfRangeException(nameof(startIndex));
 
             var byteSpan = MemoryMarshal.AsBytes(source);
@@ -133,7 +138,9 @@ namespace SharedMemory
             if (count == -1)
                 count = _length - startIndex;
 
-            if ((uint)startIndex + (uint)count > (uint)_length)
+            // Long arithmetic — see CopyTo. Plus explicit negative-count rejection because
+            // Fill(value, 0, -2) would compute -2 in long and pass the upper-bound check.
+            if (startIndex < 0 || count < 0 || (long)startIndex + count > _length)
                 throw new ArgumentOutOfRangeException();
 
             // Batch fill: create a filled buffer and write in chunks
@@ -206,11 +213,15 @@ namespace SharedMemory
         }
 
         /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
+        /// Releases unmanaged resources if Dispose was not called. Does NOT proactively dispose
+        /// the inner <see cref="HighPerformanceSharedBuffer"/> — that has its own finalizer and
+        /// touching it from here risks running against an already-finalized peer (finalizer
+        /// order is undefined). The peer's finalizer reclaims its unmanaged handles directly.
         /// </summary>
         ~SharedArray()
         {
-            _buffer?.Dispose();
+            // Just mark disposed so a racing manual Dispose is a no-op. No managed work here.
+            Interlocked.Exchange(ref _disposed, 1);
         }
     }
 }

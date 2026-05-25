@@ -995,6 +995,13 @@ namespace SharedMemory
         /// <summary>
         /// RAII wrapper for write lock with double-dispose and reentrant safety.
         /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
+        ///
+        /// <para><b>Do not copy this struct.</b> The double-dispose guard (an
+        /// <c>Interlocked.Exchange</c> on <c>_onDispose</c>) operates on the struct's own field,
+        /// not a shared one. Copying the struct duplicates the field, and each copy's
+        /// <c>Dispose()</c> will independently decrement the lock depth — corrupting the
+        /// reentrant depth counter and potentially releasing the underlying buffer lock twice.
+        /// Always consume via <c>using var ... = AcquireWriteLock(...)</c>, never <c>var copy = lock;</c>.</para>
         /// </summary>
         public struct WriteLock : IDisposable
         {
@@ -1025,6 +1032,10 @@ namespace SharedMemory
         /// <summary>
         /// RAII wrapper for read lock with double-dispose and reentrant safety.
         /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
+        ///
+        /// <para><b>Do not copy this struct.</b> Same reasoning as <see cref="WriteLock"/> —
+        /// copies will each run <c>Dispose()</c>, double-decrementing the reentrant depth and
+        /// potentially releasing the underlying buffer lock twice.</para>
         /// </summary>
         public struct ReadLock : IDisposable
         {

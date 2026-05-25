@@ -28,13 +28,26 @@ namespace SharedMemory
         public int Size => ElementSize * ArrayLength;
 
         /// <summary>
+        /// Validates the field name. Empty/whitespace names produce schemas that crash with
+        /// confusing downstream errors (duplicate-empty-key conflicts, "field '' not found"
+        /// at runtime), so we reject at the factory boundary instead.
+        /// </summary>
+        private static void ValidateName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("Field name cannot be null, empty, or whitespace", nameof(name));
+        }
+
+        /// <summary>
         /// Creates a scalar field definition for a primitive type.
         /// </summary>
         /// <typeparam name="T">Unmanaged value type</typeparam>
         /// <param name="name">Field name</param>
         /// <returns>Field definition for a single value</returns>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="name"/> is null/empty/whitespace</exception>
         public static FieldDefinition Scalar<T>(string name) where T : unmanaged
         {
+            ValidateName(name);
             return new FieldDefinition
             {
                 Name = name,
@@ -55,6 +68,7 @@ namespace SharedMemory
         /// <exception cref="ArgumentOutOfRangeException">Thrown when length is not positive</exception>
         public static FieldDefinition Array<T>(string name, int length) where T : unmanaged
         {
+            ValidateName(name);
             if (length <= 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
 
@@ -77,6 +91,7 @@ namespace SharedMemory
         /// <exception cref="ArgumentOutOfRangeException">Thrown when maxLength is not positive</exception>
         public static FieldDefinition String(string name, int maxLength)
         {
+            ValidateName(name);
             if (maxLength <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxLength));
 
@@ -98,6 +113,7 @@ namespace SharedMemory
         /// <returns>Field definition for a struct value</returns>
         public static FieldDefinition Struct<T>(string name) where T : unmanaged
         {
+            ValidateName(name);
             return new FieldDefinition
             {
                 Name = name,
@@ -118,6 +134,7 @@ namespace SharedMemory
         /// <exception cref="ArgumentOutOfRangeException">Thrown when length is not positive</exception>
         public static FieldDefinition StructArray<T>(string name, int length) where T : unmanaged
         {
+            ValidateName(name);
             if (length <= 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
 
@@ -142,6 +159,7 @@ namespace SharedMemory
         /// <exception cref="ArgumentOutOfRangeException">Thrown when maxSize is not positive</exception>
         public static FieldDefinition Blob(string name, int maxSize)
         {
+            ValidateName(name);
             if (maxSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxSize));
 
@@ -166,6 +184,7 @@ namespace SharedMemory
         /// <exception cref="ArgumentOutOfRangeException">Thrown when maxByteLength is not positive</exception>
         public static FieldDefinition Utf8String(string name, int maxByteLength)
         {
+            ValidateName(name);
             if (maxByteLength <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxByteLength));
 

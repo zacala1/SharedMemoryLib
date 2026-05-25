@@ -32,7 +32,10 @@ namespace SharedMemory
 
         public override MemoryHandle Pin(int elementIndex = 0)
         {
-            if (elementIndex < 0 || elementIndex >= _length)
+            // MemoryManager<T> contract accepts elementIndex == Length (returns a handle to
+            // the one-past-the-end address, used for empty-tail slices like
+            // mem.Slice(Length).Pin()). The previous strict < check rejected that legal call.
+            if (elementIndex < 0 || elementIndex > _length)
                 throw new ArgumentOutOfRangeException(nameof(elementIndex));
 
             return new MemoryHandle(_pointer + elementIndex);

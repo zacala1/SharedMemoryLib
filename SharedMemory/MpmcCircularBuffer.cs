@@ -172,18 +172,31 @@ namespace SharedMemory
 
             _buffer = new HighPerformanceSharedBuffer(name, options);
 
-            var memory = _buffer.GetMemory(0, (int)capacity);
-            _memoryHandle = memory.Pin();
-            _header = (Header*)_memoryHandle.Pointer;
-            _dataPtr = (byte*)_memoryHandle.Pointer + HeaderSize;
+            // After _buffer is live, any throw in GetMemory/Pin/InitializeBuffer/ValidateBuffer
+            // would leak the underlying shared section until finalization. Wrap to guarantee
+            // deterministic cleanup — ValidateBuffer in particular can throw on mismatch when
+            // a non-owner opens an existing region.
+            try
+            {
+                var memory = _buffer.GetMemory(0, (int)capacity);
+                _memoryHandle = memory.Pin();
+                _header = (Header*)_memoryHandle.Pointer;
+                _dataPtr = (byte*)_memoryHandle.Pointer + HeaderSize;
 
-            if (create && _buffer.IsOwner)
-            {
-                InitializeBuffer();
+                if (create && _buffer.IsOwner)
+                {
+                    InitializeBuffer();
+                }
+                else
+                {
+                    ValidateBuffer();
+                }
             }
-            else
+            catch
             {
-                ValidateBuffer();
+                try { _memoryHandle.Dispose(); } catch { /* may be uninitialized */ }
+                _buffer.Dispose();
+                throw;
             }
         }
 
@@ -468,17 +481,21 @@ namespace SharedMemory
                 return;
 
             _memoryHandle.Dispose();
+            // See LockFreeCircularBuffer: only dispose the managed _buffer on the deterministic
+            // path. The finalizer below skips it to avoid touching peer objects whose own
+            // finalizers may have already run.
             _buffer?.Dispose();
             GC.SuppressFinalize(this);
         }
 
         /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
+        /// Releases unmanaged resources if Dispose was not called.
         /// </summary>
         ~MpmcCircularBuffer()
         {
-            _memoryHandle.Dispose();
-            _buffer?.Dispose();
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            try { _memoryHandle.Dispose(); } catch { /* best-effort */ }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

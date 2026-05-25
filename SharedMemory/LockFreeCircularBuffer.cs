@@ -123,17 +123,28 @@ namespace SharedMemory
 
             _buffer = new HighPerformanceSharedBuffer(name, options);
 
-            // Get direct pointer access for maximum performance
-            var memory = _buffer.GetMemory(0, (int)(HeaderSize + _capacity));
-            _memoryHandle = memory.Pin();
-            _header = (Header*)_memoryHandle.Pointer;
-            _dataPtr = (byte*)_memoryHandle.Pointer + HeaderSize;
-
-            if (create)
+            // After _buffer is live, any throw in GetMemory/Pin/header-init would leak the
+            // underlying shared section until finalization. Wrap to guarantee deterministic
+            // cleanup, mirroring HighPerformanceSharedBuffer's own constructor-leak fix.
+            try
             {
-                _header->WritePosition = 0;
-                _header->ReadPosition = 0;
-                Thread.MemoryBarrier();
+                var memory = _buffer.GetMemory(0, (int)(HeaderSize + _capacity));
+                _memoryHandle = memory.Pin();
+                _header = (Header*)_memoryHandle.Pointer;
+                _dataPtr = (byte*)_memoryHandle.Pointer + HeaderSize;
+
+                if (create)
+                {
+                    _header->WritePosition = 0;
+                    _header->ReadPosition = 0;
+                    Thread.MemoryBarrier();
+                }
+            }
+            catch
+            {
+                try { _memoryHandle.Dispose(); } catch { /* may be uninitialized */ }
+                _buffer.Dispose();
+                throw;
             }
         }
 
@@ -356,18 +367,26 @@ namespace SharedMemory
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // MemoryHandle wraps an unmanaged pointer — safe to dispose anywhere.
             _memoryHandle.Dispose();
+            // _buffer (HighPerformanceSharedBuffer) is a managed object with its OWN finalizer.
+            // We only proactively dispose it on the deterministic path; from our finalizer we
+            // let the GC handle it to avoid touching a possibly-already-finalized peer.
             _buffer?.Dispose();
             GC.SuppressFinalize(this);
         }
 
         /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
+        /// Releases unmanaged resources if Dispose was not called.
+        /// Skips the managed <c>_buffer.Dispose()</c> — its own finalizer reclaims it.
         /// </summary>
         ~LockFreeCircularBuffer()
         {
-            _memoryHandle.Dispose();
-            _buffer?.Dispose();
+            // Guard against double-dispose if Dispose() already ran. _disposed is volatile so
+            // we observe its current value here.
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            try { _memoryHandle.Dispose(); } catch { /* unmanaged release; best-effort */ }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

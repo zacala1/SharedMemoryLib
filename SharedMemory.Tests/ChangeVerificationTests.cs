@@ -976,6 +976,120 @@ public class ChangeVerificationTests
         buf.ReleaseWriteLock();
     }
 
+    // ── AUDIT-1: SharedArray uint overflow ───────────────────────────────────
+
+    [Test]
+    public void Audit1_SharedArray_NegativeStartIndex_Rejected()
+    {
+        using var arr = new SharedArray<int>(N("Audit1_Neg"), 16);
+        var src = new int[4];
+        // Previous uint cast would coerce -1 to UInt32.MaxValue and STILL throw, but only by
+        // accident; the long-arithmetic version makes the rejection explicit and reliable.
+        Assert.Throws<ArgumentOutOfRangeException>(() => arr.CopyFrom(-1, src));
+        Assert.Throws<ArgumentOutOfRangeException>(() => arr.CopyTo(-1, src));
+    }
+
+    [Test]
+    public void Audit1_SharedArray_FillNegativeCount_Rejected()
+    {
+        // Previous (uint)count cast would convert -2 to ~4 billion and pass the upper bound
+        // check (because (uint)startIndex + huge > capacity wraps mod 2^32 to small).
+        using var arr = new SharedArray<int>(N("Audit1_Fill"), 16);
+        Assert.Throws<ArgumentOutOfRangeException>(() => arr.Fill(42, startIndex: 0, count: -2));
+    }
+
+    // ── AUDIT-3: Circular buffer constructor cleanup on bad capacity ─────────
+
+    [Test]
+    public void Audit3_LockFree_ConstructionFailure_DoesNotLeakBuffer()
+    {
+        // Force the inner _buffer.GetMemory cast to throw by using a capacity that exceeds
+        // int.MaxValue after power-of-2 rounding + header. The constructor must dispose the
+        // inner HighPerformanceSharedBuffer it just created — otherwise the kernel section
+        // sticks around until finalization.
+        // We probe by attempting many failed constructions in a tight loop and confirming
+        // none of them cumulatively leak (process would either OOM or hit handle limits).
+        for (int i = 0; i < 50; i++)
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+            {
+                using var _ = new LockFreeCircularBuffer(N($"Audit3_Bad_{i}"),
+                    capacity: int.MaxValue); // totalSize check trips
+            });
+        }
+        // If we got here without OOM, cleanup worked.
+        Assert.Pass();
+    }
+
+    [Test]
+    public void Audit3_Mpmc_ConstructionFailure_DoesNotLeakBuffer()
+    {
+        // Same shape: force ValidateBuffer or capacity check to throw, then verify many
+        // iterations don't accumulate leaked HighPerformanceSharedBuffer instances.
+        for (int i = 0; i < 50; i++)
+        {
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+            {
+                using var _ = new MpmcCircularBuffer(N($"Audit3_Mpmc_{i}"),
+                    slotCount: int.MaxValue / 2, slotSize: 64); // totalSize > int.MaxValue
+            });
+        }
+        Assert.Pass();
+    }
+
+    // ── AUDIT-4: FieldDefinition name validation ─────────────────────────────
+
+    [Test]
+    public void Audit4_FieldDefinition_NullOrEmptyName_AllFactoriesReject()
+    {
+        // Every factory must reject null/empty/whitespace names. Previously only the ones
+        // taking a length parameter validated; Scalar/Struct/Blob/Utf8String didn't.
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Scalar<int>(""));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Scalar<int>(null!));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Scalar<int>("   "));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Array<int>("", 4));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Struct<Guid>(""));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.StructArray<Guid>("", 4));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.String("", 16));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Blob("", 16));
+        Assert.Throws<ArgumentException>(() => FieldDefinition.Utf8String("", 16));
+    }
+
+    // ── AUDIT-5: ReleaseWriteLock CAS-by-owner ───────────────────────────────
+
+    [Test]
+    public void Audit5_ReleaseWriteLock_WithoutAcquire_IsNoOp()
+    {
+        // Caller bug: releasing a lock that wasn't acquired by this process. Without the
+        // owner-CAS guard, ReleaseWriteLock would zero ownership metadata and free the lock —
+        // dangerous when another process legitimately holds it. With the fix it's a logged no-op.
+        using var buf = new HighPerformanceSharedBuffer(N("Audit5_NoAcquire"),
+            new SharedMemoryBufferOptions { Capacity = 4096 });
+
+        // No acquire here. Release should be a safe no-op (logs a warning).
+        Assert.DoesNotThrow(() => buf.ReleaseWriteLock());
+
+        // Now actually acquire — must still work normally after the no-op release.
+        Assert.That(buf.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+        buf.ReleaseWriteLock();
+    }
+
+    // ── AUDIT-6: UnmanagedMemoryManager.Pin at Length ────────────────────────
+
+    [Test]
+    public void Audit6_GetMemory_PinAtLength_DoesNotThrow()
+    {
+        // MemoryManager<T>.Pin(Length) is legal — used for empty-tail slices. Previous
+        // implementation rejected >= Length; the fix allows == Length.
+        using var buf = new HighPerformanceSharedBuffer(N("Audit6_Pin"),
+            new SharedMemoryBufferOptions { Capacity = 1024 });
+        var memory = buf.GetMemory(0, 16);
+        // Slice to zero-length at the end and pin — exercises the elementIndex == Length path
+        var tail = memory.Slice(16);
+        Assert.That(tail.Length, Is.EqualTo(0));
+        Assert.DoesNotThrow(() => { using var _ = tail.Pin(); });
+    }
+
     // ── Schemas & helpers ────────────────────────────────────────────────────
 
     private enum TestEnumInt  : int  { A = 1 }

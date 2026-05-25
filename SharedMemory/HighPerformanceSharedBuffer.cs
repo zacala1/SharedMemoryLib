@@ -687,8 +687,26 @@ namespace SharedMemory
 
             var header = (SharedHeader*)_basePtr;
 
-            // Clear ownership info
-            header->LockOwnerProcessId = 0;
+            // Ownership check before release. Without this, a caller that releases a lock it
+            // never acquired would silently zero out a legitimate cross-process writer's
+            // metadata and free the lock — corrupting that writer's critical section.
+            // CAS-by-PID: only clear ownership if we're the recorded owner; otherwise we leave
+            // the lock untouched and log. This is intentionally asymmetric with
+            // TryForceReleaseWriteLock, which exists precisely to override ownership when the
+            // owner is dead (and uses its own CAS-by-orphan-PID).
+            int currentPid = Environment.ProcessId;
+            int prev = Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, currentPid);
+            if (prev != currentPid)
+            {
+                // Not our lock to release. Could be: (a) caller never acquired; (b) cross-process
+                // lock owned by another PID; (c) lock already released. All three are caller bugs
+                // — log and return without touching shared state.
+                _logger?.LogWarning(
+                    "ReleaseWriteLock called from PID {Pid} but lock owner is {OwnerPid} — ignored",
+                    currentPid, prev);
+                return;
+            }
+
             header->LockOwnerThreadId = 0;
             header->LockOwnerProcessStartTime = 0;
             header->LockAcquiredTimestamp = 0;
@@ -965,12 +983,17 @@ namespace SharedMemory
                 return;
 
             _logger?.LogDebug("Disposing shared buffer '{Name}'", _name);
-            Cleanup();
+            Cleanup(disposing: true);
             GC.SuppressFinalize(this);
         }
 
-        private void Cleanup()
+        private void Cleanup(bool disposing = true)
         {
+            // We always release the unmanaged pointer and dispose the OS handles, regardless of
+            // disposing — those are unmanaged resources and that's exactly what a finalizer must
+            // reclaim. What we skip from the finalizer is anything touching managed state with
+            // unpredictable lifetime: the logger (may itself be finalized), File.Delete (heavy
+            // syscall path during shutdown), and any code that allocates.
             try
             {
                 if (_basePtr != null && _accessor != null)
@@ -981,7 +1004,7 @@ namespace SharedMemory
             }
             catch (Exception ex)
             {
-                _logger?.LogWarning(ex, "Failed to release memory pointer during cleanup");
+                if (disposing) _logger?.LogWarning(ex, "Failed to release memory pointer during cleanup");
             }
 
             try
@@ -991,7 +1014,7 @@ namespace SharedMemory
             }
             catch (Exception ex)
             {
-                _logger?.LogWarning(ex, "Failed to dispose accessor during cleanup");
+                if (disposing) _logger?.LogWarning(ex, "Failed to dispose accessor during cleanup");
             }
 
             try
@@ -1001,7 +1024,7 @@ namespace SharedMemory
             }
             catch (Exception ex)
             {
-                _logger?.LogWarning(ex, "Failed to dispose memory-mapped file during cleanup");
+                if (disposing) _logger?.LogWarning(ex, "Failed to dispose memory-mapped file during cleanup");
             }
 
             try
@@ -1012,41 +1035,44 @@ namespace SharedMemory
             }
             catch (Exception ex)
             {
-                _logger?.LogWarning(ex, "Failed to dispose backing file during cleanup");
+                if (disposing) _logger?.LogWarning(ex, "Failed to dispose backing file during cleanup");
             }
 
             // /dev/shm files persist past process death (unlike Windows MMF which auto-cleans
             // when the last handle closes). Two cases where we unlink:
             //   1. We're the application-level owner (won the magic CAS) — clean shutdown.
-            //   2. We sized the file but never finished construction (_createdBackingFile && _basePtr==null
-            //      at this point because we already nulled it above). A half-initialized file
-            //      would cause the next open to throw "Capacity mismatch" or worse if the size
-            //      ended up partial. Better to unlink and let the next caller re-create.
-            // Both are best-effort: if another process is using the region, its open fd keeps
-            // the inode alive on Linux, so we only remove the directory entry.
-            bool shouldUnlink = _backingFilePath != null && (_isOwner || _createdBackingFile);
-            if (shouldUnlink)
+            //   2. We sized the file but never finished construction. A half-initialized file
+            //      would cause the next open to throw "Capacity mismatch".
+            // Both are best-effort. We SKIP this from the finalizer: File.Delete is a heavy
+            // syscall path and the process is dying anyway — if the OS process leaves the file
+            // behind, an orchestrator (or our own owner-on-restart) will reclaim it.
+            if (disposing)
             {
-                try
+                bool shouldUnlink = _backingFilePath != null && (_isOwner || _createdBackingFile);
+                if (shouldUnlink)
                 {
-                    if (File.Exists(_backingFilePath!))
-                        File.Delete(_backingFilePath!);
+                    try
+                    {
+                        if (File.Exists(_backingFilePath!))
+                            File.Delete(_backingFilePath!);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' during cleanup", _backingFilePath);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' during cleanup", _backingFilePath);
-                }
+                _backingFilePath = null;
+                _createdBackingFile = false;
             }
-            _backingFilePath = null;
-            _createdBackingFile = false;
         }
 
         /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
+        /// Releases unmanaged resources if Dispose was not called. Touches only unmanaged
+        /// state — see <see cref="Cleanup"/> for the disposing-flag rationale.
         /// </summary>
         ~HighPerformanceSharedBuffer()
         {
-            Cleanup();
+            Cleanup(disposing: false);
         }
     }
 }
