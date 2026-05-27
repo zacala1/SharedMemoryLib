@@ -47,6 +47,7 @@ namespace SharedMemory
         // file on Linux. Lets Cleanup unlink the file when construction fails partway through —
         // otherwise a half-sized file would persist in tmpfs and corrupt the next open.
         private bool _createdBackingFile;
+        private bool _initializedSuccessfully;
         private byte* _basePtr;
 
         // Performance counters
@@ -148,10 +149,10 @@ namespace SharedMemory
         /// Creates or opens a high-performance shared memory buffer.
         /// </summary>
         /// <param name="name">Unique name for the shared memory region</param>
-        /// <param name="options">Configuration options for the buffer</param>
+        /// <param name="options">Configuration options for the buffer. Defaults are used when null.</param>
         /// <exception cref="ArgumentException">Thrown when name is empty or whitespace</exception>
         /// <exception cref="ArgumentOutOfRangeException">Thrown when options contain invalid values</exception>
-        public HighPerformanceSharedBuffer(string name, SharedMemoryBufferOptions options)
+        public HighPerformanceSharedBuffer(string name, SharedMemoryBufferOptions? options = null)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty", nameof(name));
@@ -175,6 +176,9 @@ namespace SharedMemory
                 // leak until finalization if we let the constructor throw uncaught. Mirror the
                 // Initialize() catch here so the failure mode is deterministic.
                 _isOwner = InitializeOrOpen();
+                _initializedSuccessfully = true;
+                if (!_isOwner)
+                    _createdBackingFile = false;
             }
             catch
             {
@@ -228,9 +232,10 @@ namespace SharedMemory
         private void CreateMmfFromExplicitFilePath(long totalSize)
         {
             string? mapName = OperatingSystem.IsWindows() ? _name : null;
+            FileMode mode = _options.CreateOrOpen ? FileMode.OpenOrCreate : FileMode.Open;
             _mmf = MemoryMappedFile.CreateFromFile(
                 _options.FilePath!,
-                FileMode.OpenOrCreate,
+                mode,
                 mapName,
                 totalSize,
                 MemoryMappedFileAccess.ReadWrite);
@@ -248,12 +253,17 @@ namespace SharedMemory
         [SupportedOSPlatform("windows")]
         private void CreateMmfFromWindowsNamedRegion(long totalSize)
         {
-            _mmf = MemoryMappedFile.CreateOrOpen(
-                _name,
-                totalSize,
-                MemoryMappedFileAccess.ReadWrite,
-                MemoryMappedFileOptions.None,
-                HandleInheritability.None);
+            _mmf = _options.CreateOrOpen
+                ? MemoryMappedFile.CreateOrOpen(
+                    _name,
+                    totalSize,
+                    MemoryMappedFileAccess.ReadWrite,
+                    MemoryMappedFileOptions.None,
+                    HandleInheritability.None)
+                : MemoryMappedFile.OpenExisting(
+                    _name,
+                    MemoryMappedFileRights.ReadWrite,
+                    HandleInheritability.None);
         }
 
         /// <summary>
@@ -266,11 +276,20 @@ namespace SharedMemory
         private void CreateMmfFromLinuxDevShm(long totalSize)
         {
             _backingFilePath = "/dev/shm/" + SanitizeLinuxName(_name);
+            FileMode mode = _options.CreateOrOpen ? FileMode.OpenOrCreate : FileMode.Open;
             _backingFile = new FileStream(_backingFilePath,
-                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+                mode, FileAccess.ReadWrite, FileShare.ReadWrite);
 
             if (_backingFile.Length == 0)
             {
+                if (!_options.CreateOrOpen)
+                {
+                    _backingFile.Dispose();
+                    _backingFile = null;
+                    throw new InvalidDataException(
+                        $"Existing shared memory '{_backingFilePath}' is empty and has not been initialized.");
+                }
+
                 // Fresh region — set the size up front. Subsequent openers will see this length
                 // and skip the SetLength call below. Mark that WE were the process to size this
                 // file: if construction fails between here and AcquirePointer, Cleanup will
@@ -371,8 +390,11 @@ namespace SharedMemory
                 header->ReaderCount = 0;
                 header->LockOwnerProcessId = 0;
                 header->LockOwnerThreadId = 0;
+                header->LockOwnerProcessStartTime = 0;
                 header->LockAcquiredTimestamp = 0;
                 header->DataChecksum = 0;
+                header->ChecksumOffset = 0;
+                header->ChecksumLength = 0;
 
                 Thread.MemoryBarrier();
 
@@ -601,6 +623,7 @@ namespace SharedMemory
         public bool TryAcquireWriteLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
 
             var header = (SharedHeader*)_basePtr;
             var sw = Stopwatch.StartNew();
@@ -626,7 +649,7 @@ namespace SharedMemory
                         var readerSpinner = new SpinWait();
                         while (Volatile.Read(ref header->ReaderCount) > 0)
                         {
-                            if (sw.Elapsed > timeout)
+                            if (TimeoutHelper.HasExpired(sw, timeout))
                             {
                                 return false; // Will release lock in finally
                             }
@@ -652,15 +675,14 @@ namespace SharedMemory
                     }
                 }
 
-                if (sw.Elapsed > timeout)
+                if (TimeoutHelper.HasExpired(sw, timeout))
                     return false;
 
                 if (_options.EnableOrphanLockDetection)
                 {
                     // Check on first CAS failure; re-check when nearing timeout (≥75% elapsed)
                     // so a lock that becomes orphaned mid-wait is still recovered before giving up.
-                    bool nearTimeout = timeout > TimeSpan.Zero &&
-                        sw.Elapsed.TotalMilliseconds >= timeout.TotalMilliseconds * 0.75;
+                    bool nearTimeout = TimeoutHelper.IsNearExpiry(sw, timeout, 0.75);
 
                     if (!orphanCheckDone || (nearTimeout && !orphanCheckNearTimeout))
                     {
@@ -687,20 +709,21 @@ namespace SharedMemory
 
             var header = (SharedHeader*)_basePtr;
 
-            // Ownership check before release. Without this, a caller that releases a lock it
-            // never acquired would silently zero out a legitimate cross-process writer's
-            // metadata and free the lock — corrupting that writer's critical section.
-            // CAS-by-PID: only clear ownership if we're the recorded owner; otherwise we leave
-            // the lock untouched and log. This is intentionally asymmetric with
-            // TryForceReleaseWriteLock, which exists precisely to override ownership when the
-            // owner is dead (and uses its own CAS-by-orphan-PID).
             int currentPid = Environment.ProcessId;
+            long currentThreadId = Environment.CurrentManagedThreadId;
+            int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
+            long ownerThreadId = Volatile.Read(ref header->LockOwnerThreadId);
+            if (ownerPid != currentPid || ownerThreadId != currentThreadId)
+            {
+                _logger?.LogWarning(
+                    "ReleaseWriteLock called from PID {Pid}/thread {ThreadId} but lock owner is PID {OwnerPid}/thread {OwnerThreadId} — ignored",
+                    currentPid, currentThreadId, ownerPid, ownerThreadId);
+                return;
+            }
+
             int prev = Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, currentPid);
             if (prev != currentPid)
             {
-                // Not our lock to release. Could be: (a) caller never acquired; (b) cross-process
-                // lock owned by another PID; (c) lock already released. All three are caller bugs
-                // — log and return without touching shared state.
                 _logger?.LogWarning(
                     "ReleaseWriteLock called from PID {Pid} but lock owner is {OwnerPid} — ignored",
                     currentPid, prev);
@@ -721,6 +744,7 @@ namespace SharedMemory
         public bool TryAcquireReadLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
 
             var header = (SharedHeader*)_basePtr;
             var sw = Stopwatch.StartNew();
@@ -734,7 +758,7 @@ namespace SharedMemory
                 int writerState = Volatile.Read(ref header->WriterLockState);
                 if (writerState != 0)
                 {
-                    if (sw.Elapsed > timeout)
+                    if (TimeoutHelper.HasExpired(sw, timeout))
                         return false;
                     spinner.SpinOnce();
                     continue;
@@ -756,7 +780,7 @@ namespace SharedMemory
                 // twice extra — same penalty as the previous design's CAS-rollback path.
                 Interlocked.Decrement(ref header->ReaderCount);
 
-                if (sw.Elapsed > timeout)
+                if (TimeoutHelper.HasExpired(sw, timeout))
                     return false;
 
                 spinner.SpinOnce();
@@ -769,7 +793,20 @@ namespace SharedMemory
             ThrowIfDisposed();
 
             var header = (SharedHeader*)_basePtr;
-            Interlocked.Decrement(ref header->ReaderCount);
+            while (true)
+            {
+                int current = Volatile.Read(ref header->ReaderCount);
+                if (current <= 0)
+                {
+                    _logger?.LogWarning(
+                        "ReleaseReadLock called when reader count is {ReaderCount} — ignored",
+                        current);
+                    return;
+                }
+
+                if (Interlocked.CompareExchange(ref header->ReaderCount, current - 1, current) == current)
+                    return;
+            }
         }
 
         /// <inheritdoc/>
@@ -878,16 +915,19 @@ namespace SharedMemory
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
 
-            try
+            if (_options.EnableEvents)
             {
-                OnOrphanLockDetected?.Invoke(this, new BufferEventArgs
+                try
                 {
-                    EventType = BufferEventType.OrphanLockDetected
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
+                    OnOrphanLockDetected?.Invoke(this, new BufferEventArgs
+                    {
+                        EventType = BufferEventType.OrphanLockDetected
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
+                }
             }
 
             return true;
@@ -927,7 +967,7 @@ namespace SharedMemory
             var header = (SharedHeader*)_basePtr;
 
             if (header->ChecksumLength == 0)
-                return true; // No checksum stored
+                return !_options.EnableChecksumVerification;
 
             uint stored = header->DataChecksum;
             uint calculated = CalculateChecksum(header->ChecksumOffset, header->ChecksumLength);
@@ -942,9 +982,7 @@ namespace SharedMemory
             return valid;
         }
 
-        /// <summary>
-        /// Updates the stored checksum for a data region
-        /// </summary>
+        /// <inheritdoc/>
         public void UpdateChecksum(long offset, int length)
         {
             ThrowIfDisposed();
@@ -1038,17 +1076,14 @@ namespace SharedMemory
                 if (disposing) _logger?.LogWarning(ex, "Failed to dispose backing file during cleanup");
             }
 
-            // /dev/shm files persist past process death (unlike Windows MMF which auto-cleans
-            // when the last handle closes). Two cases where we unlink:
-            //   1. We're the application-level owner (won the magic CAS) — clean shutdown.
-            //   2. We sized the file but never finished construction. A half-initialized file
-            //      would cause the next open to throw "Capacity mismatch".
-            // Both are best-effort. We SKIP this from the finalizer: File.Delete is a heavy
-            // syscall path and the process is dying anyway — if the OS process leaves the file
-            // behind, an orchestrator (or our own owner-on-restart) will reclaim it.
+            // Do not unlink a successfully initialized /dev/shm region on normal Dispose:
+            // existing mappings would keep working while later openers get a brand-new file,
+            // splitting one logical name into two independent regions. Only remove files that
+            // this instance sized but failed to initialize.
             if (disposing)
             {
-                bool shouldUnlink = _backingFilePath != null && (_isOwner || _createdBackingFile);
+                bool constructionFailed = !_initializedSuccessfully;
+                bool shouldUnlink = _backingFilePath != null && constructionFailed && _createdBackingFile;
                 if (shouldUnlink)
                 {
                     try
@@ -1061,7 +1096,8 @@ namespace SharedMemory
                         _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' during cleanup", _backingFilePath);
                     }
                 }
-                _backingFilePath = null;
+                if (constructionFailed)
+                    _backingFilePath = null;
                 _createdBackingFile = false;
             }
         }

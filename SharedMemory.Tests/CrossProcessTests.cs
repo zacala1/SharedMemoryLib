@@ -11,7 +11,7 @@ namespace SharedMemory.Tests;
 
 /// <summary>
 /// Cross-process integration tests that validate actual IPC scenarios by spawning
-/// a child process (SharedMemory.IpcHelper.exe) to perform complementary read/write
+/// a child process (dotnet SharedMemory.IpcHelper.dll) to perform complementary read/write
 /// operations on the same named shared memory region.
 ///
 /// These tests are the only ones that exercise the true "two separate processes share
@@ -21,17 +21,15 @@ namespace SharedMemory.Tests;
 [Category("CrossProcess")]
 public class CrossProcessTests
 {
-    // Locate the IpcHelper binary relative to this test assembly.
-    // Both are built into the same output configuration (Debug/net8.0-windows).
-    private static readonly string HelperExe = Path.Combine(
+    private static readonly string HelperDll = Path.Combine(
         AppContext.BaseDirectory,
-        "SharedMemory.IpcHelper.exe");
+        "SharedMemory.IpcHelper.dll");
 
     [OneTimeSetUp]
     public void EnsureHelperExists()
     {
-        if (!File.Exists(HelperExe))
-            Assert.Ignore($"IpcHelper binary not found at '{HelperExe}'. " +
+        if (!File.Exists(HelperDll))
+            Assert.Ignore($"IpcHelper binary not found at '{HelperDll}'. " +
                           "Build the SharedMemory.IpcHelper project first.");
     }
 
@@ -44,8 +42,8 @@ public class CrossProcessTests
     {
         var psi = new ProcessStartInfo
         {
-            FileName               = HelperExe,
-            Arguments              = $"{role} {bufferName}",
+            FileName               = "dotnet",
+            Arguments              = $"\"{HelperDll}\" {role} {bufferName}",
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             UseShellExecute        = false,

@@ -295,8 +295,22 @@ public class HighPerformanceSharedBufferTests
 
         var testData = new byte[] { 10, 20, 30, 40, 50 };
         buffer.Write(testData, 0);
+        buffer.UpdateChecksum(0, testData.Length);
 
         Assert.That(buffer.VerifyIntegrity(), Is.True);
+    }
+
+    [Test]
+    public void VerifyIntegrity_WhenEnabledWithoutStoredChecksum_ShouldReturnFalse()
+    {
+        var options = new SharedMemoryBufferOptions
+        {
+            Capacity = 4096,
+            EnableChecksumVerification = true
+        };
+        using var buffer = new HighPerformanceSharedBuffer(TestBufferName + "_IntegrityNoChecksum", options);
+
+        Assert.That(buffer.VerifyIntegrity(), Is.False);
     }
 
     #endregion

@@ -5,7 +5,7 @@ using SharedMemory;
 namespace SharedMemory.Benchmark;
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class HighPerformanceSharedBufferBenchmark
 {
     private HighPerformanceSharedBuffer _buffer = null!;
@@ -96,7 +96,7 @@ public class HighPerformanceSharedBufferBenchmark
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class HighPerformanceSharedBufferThroughputBenchmark
 {
     private HighPerformanceSharedBuffer _buffer = null!;

@@ -5,7 +5,7 @@ using SharedMemory;
 namespace SharedMemory.Benchmark;
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class SharedArrayBenchmark
 {
     private SharedArray<int> _intArray = null!;
@@ -112,7 +112,7 @@ public class SharedArrayBenchmark
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class SharedArrayVsNativeArrayBenchmark
 {
     private SharedArray<int> _sharedArray = null!;

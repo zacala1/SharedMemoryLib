@@ -41,7 +41,7 @@ public struct LargeTypeSchema : ISharedMemorySchema
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class StrictSharedMemoryBenchmark
 {
     private StrictSharedMemory<BenchmarkSchema> _memory = null!;
@@ -134,7 +134,7 @@ public class StrictSharedMemoryBenchmark
 /// long(8B)은 auto-lock 없음, Guid/decimal/DateTimeOffset(16B)은 auto-lock 적용
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class AutoLockOverheadBenchmark
 {
     private StrictSharedMemory<LargeTypeSchema> _memory = null!;

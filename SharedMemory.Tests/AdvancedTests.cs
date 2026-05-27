@@ -821,12 +821,11 @@ public class AdvancedTests
     }
 
     [Test]
-    public void MpmcCircularBuffer_ZeroLengthWrite_ShouldSucceed()
+    public void MpmcCircularBuffer_ZeroLengthWrite_ShouldThrow()
     {
         using var buffer = new MpmcCircularBuffer(GetUniqueName("MpmcZeroWrite"), slotCount: 4, slotSize: 64);
 
-        var result = buffer.TryWrite(ReadOnlySpan<byte>.Empty);
-        Assert.That(result, Is.True);
+        Assert.Throws<ArgumentException>(() => buffer.TryWrite(ReadOnlySpan<byte>.Empty));
     }
 
     [Test]

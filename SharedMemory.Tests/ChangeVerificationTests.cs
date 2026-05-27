@@ -382,10 +382,10 @@ public class ChangeVerificationTests
     public void FileLayout_SchemaTypes_AreInCorrectFile()
     {
         // Verify SchemaTypes.cs types are accessible (file split didn't break visibility)
-        Assert.That(SchemaCompatibility.Strict, Is.EqualTo(SchemaCompatibility.Strict));
-        Assert.That(SchemaCompatibility.Full,   Is.EqualTo(SchemaCompatibility.Full));
-        Assert.That(SharedTypeCode.Blob,        Is.EqualTo(SharedTypeCode.Blob));
-        Assert.That(SharedTypeCode.Utf8String,  Is.EqualTo(SharedTypeCode.Utf8String));
+        Assert.That(Enum.IsDefined(typeof(SchemaCompatibility), SchemaCompatibility.Strict), Is.True);
+        Assert.That(Enum.IsDefined(typeof(SchemaCompatibility), SchemaCompatibility.Full), Is.True);
+        Assert.That(Enum.IsDefined(typeof(SharedTypeCode), SharedTypeCode.Blob), Is.True);
+        Assert.That(Enum.IsDefined(typeof(SharedTypeCode), SharedTypeCode.Utf8String), Is.True);
 
         // ISharedMemorySchema and IVersionedSchema are usable
         ISharedMemorySchema s = new SimpleSchema();

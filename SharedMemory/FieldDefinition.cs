@@ -162,6 +162,8 @@ namespace SharedMemory
             ValidateName(name);
             if (maxSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxSize));
+            if (maxSize > int.MaxValue - 4)
+                throw new ArgumentOutOfRangeException(nameof(maxSize), "Blob size is too large");
 
             return new FieldDefinition
             {
@@ -187,6 +189,8 @@ namespace SharedMemory
             ValidateName(name);
             if (maxByteLength <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxByteLength));
+            if (maxByteLength > int.MaxValue - 4)
+                throw new ArgumentOutOfRangeException(nameof(maxByteLength), "UTF-8 string size is too large");
 
             return new FieldDefinition
             {

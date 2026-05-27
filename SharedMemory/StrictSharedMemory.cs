@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -99,15 +100,23 @@ namespace SharedMemory
             };
 
             _buffer = new HighPerformanceSharedBuffer(name, options);
-
-            if (create && _buffer.IsOwner)
+            try
             {
-                InitializeMemory();
-                WriteSchemaHeader();
+                if (create && _buffer.IsOwner)
+                {
+                    InitializeMemory();
+                    WriteSchemaHeader();
+                    StoredSchemaVersion = SchemaVersion;
+                }
+                else
+                {
+                    ValidateSchemaCompatibility();
+                }
             }
-            else
+            catch
             {
-                ValidateSchemaCompatibility();
+                _buffer.Dispose();
+                throw;
             }
         }
 
@@ -127,6 +136,7 @@ namespace SharedMemory
             if (!_fields.TryGetValue(fieldName, out var metadata))
                 throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
 
+            EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
             bool isNonAtomic = Unsafe.SizeOf<T>() > AtomicThreshold;
@@ -163,6 +173,7 @@ namespace SharedMemory
             if (!_fields.TryGetValue(fieldName, out var metadata))
                 throw new ArgumentException($"Field '{fieldName}' not found in schema", nameof(fieldName));
 
+            EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
             // Auto-lock for non-atomic types (>8 bytes) to prevent torn reads
@@ -209,18 +220,45 @@ namespace SharedMemory
                     nameof(values));
 
             var bytes = MemoryMarshal.AsBytes(values);
-            bool isNonAtomic = bytes.Length > AtomicThreshold;
+            bool isNonAtomic = metadata.Size > AtomicThreshold;
 
             // Auto-lock for non-atomic operations (>8 bytes)
             if (isNonAtomic && !IsHoldingWriteLock())
             {
                 ThrowIfHoldingReadLock();
                 using var _ = AcquireWriteLock();
-                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
+                WriteArrayInternal(bytes, metadata);
             }
             else
             {
-                _buffer.Write(bytes, SchemaHeaderSize + metadata.Offset);
+                WriteArrayInternal(bytes, metadata);
+            }
+        }
+
+        private void WriteArrayInternal(ReadOnlySpan<byte> bytes, FieldMetadata metadata)
+        {
+            long baseOffset = SchemaHeaderSize + metadata.Offset;
+            if (bytes.Length > 0)
+                _buffer.Write(bytes, baseOffset);
+
+            int remaining = metadata.Size - bytes.Length;
+            if (remaining > 0)
+                ClearBytes(baseOffset + bytes.Length, remaining);
+        }
+
+        private void ClearBytes(long offset, int count)
+        {
+            Span<byte> zeros = stackalloc byte[Math.Min(count, MaxStackAllocBytes)];
+            zeros.Clear();
+
+            int remaining = count;
+            long currentOffset = offset;
+            while (remaining > 0)
+            {
+                int chunk = Math.Min(zeros.Length, remaining);
+                _buffer.Write(zeros.Slice(0, chunk), currentOffset);
+                currentOffset += chunk;
+                remaining -= chunk;
             }
         }
 
@@ -487,8 +525,11 @@ namespace SharedMemory
             int length = BitConverter.ToInt32(lengthBuf);
 
             int maxDataSize = metadata.ArrayLength - 4;
-            if (length <= 0 || length > maxDataSize)
+            if (length == 0)
                 return Array.Empty<byte>();
+            if (length < 0 || length > maxDataSize)
+                throw new InvalidDataException(
+                    $"Stored blob length {length} is outside the valid range 0..{maxDataSize}");
 
             var result = new byte[length];
             _buffer.Read(result, baseOffset + 4);
@@ -606,8 +647,11 @@ namespace SharedMemory
             int byteLength = BitConverter.ToInt32(lengthBuf);
 
             int maxDataSize = metadata.ArrayLength - 4;
-            if (byteLength <= 0 || byteLength > maxDataSize)
+            if (byteLength == 0)
                 return string.Empty;
+            if (byteLength < 0 || byteLength > maxDataSize)
+                throw new InvalidDataException(
+                    $"Stored UTF-8 string length {byteLength} is outside the valid range 0..{maxDataSize}");
 
             if (byteLength <= MaxStackAllocBytes)
             {
@@ -636,15 +680,25 @@ namespace SharedMemory
         /// This lock is reentrant: if the current thread already holds a write lock,
         /// the depth counter is incremented without acquiring the underlying lock again.
         /// </summary>
-        /// <param name="timeout">Lock acquisition timeout (default: 5 seconds)</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
-        public WriteLock AcquireWriteLock(TimeSpan timeout = default)
+        public WriteLock AcquireWriteLock()
+        {
+            return AcquireWriteLock(DefaultLockTimeout);
+        }
+
+        /// <summary>
+        /// Acquires an exclusive write lock on the entire memory region.
+        /// This lock is reentrant: if the current thread already holds a write lock,
+        /// the depth counter is incremented without acquiring the underlying lock again.
+        /// </summary>
+        /// <param name="timeout">Lock acquisition timeout</param>
+        /// <returns>A disposable lock guard that releases the lock on dispose</returns>
+        /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        public WriteLock AcquireWriteLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
-
-            if (timeout == default)
-                timeout = DefaultLockTimeout;
+            TimeoutHelper.Validate(timeout, nameof(timeout));
 
             // Reentrant: if already holding write lock, just increment depth
             if (_writeLockDepth.Value > 0)
@@ -665,15 +719,25 @@ namespace SharedMemory
         /// This lock is reentrant: if the current thread already holds any lock (read or write),
         /// the depth counter is incremented without acquiring the underlying lock again.
         /// </summary>
-        /// <param name="timeout">Lock acquisition timeout (default: 5 seconds)</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
-        public ReadLock AcquireReadLock(TimeSpan timeout = default)
+        public ReadLock AcquireReadLock()
+        {
+            return AcquireReadLock(DefaultLockTimeout);
+        }
+
+        /// <summary>
+        /// Acquires a shared read lock on the entire memory region.
+        /// This lock is reentrant: if the current thread already holds any lock (read or write),
+        /// the depth counter is incremented without acquiring the underlying lock again.
+        /// </summary>
+        /// <param name="timeout">Lock acquisition timeout</param>
+        /// <returns>A disposable lock guard that releases the lock on dispose</returns>
+        /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        public ReadLock AcquireReadLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
-
-            if (timeout == default)
-                timeout = DefaultLockTimeout;
+            TimeoutHelper.Validate(timeout, nameof(timeout));
 
             // Reentrant: if already holding any lock, just increment depth
             if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
@@ -743,6 +807,12 @@ namespace SharedMemory
             int storedFieldCount = BitConverter.ToInt32(header.Slice(8));
             int storedHash = BitConverter.ToInt32(header.Slice(12));
 
+            if (StoredSchemaVersion == SchemaVersion && storedFieldCount != _fields.Count)
+            {
+                throw new InvalidOperationException(
+                    $"Schema field count mismatch: expected {_fields.Count}, found {storedFieldCount}");
+            }
+
             // Check version compatibility
             if (StoredSchemaVersion != SchemaVersion)
             {
@@ -785,20 +855,22 @@ namespace SharedMemory
 
         private int ComputeSchemaHash()
         {
-            // Sort field names for deterministic hash (replaces LINQ OrderBy)
             var fieldValues = new List<FieldMetadata>(_fields.Values);
-            fieldValues.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+            fieldValues.Sort((a, b) => a.Offset.CompareTo(b.Offset));
 
             unchecked
             {
                 int hash = 17;
+                hash = hash * 31 + fieldValues.Count;
                 foreach (var field in fieldValues)
                 {
-                    // Use stable hash instead of GetHashCode() which varies per process in .NET Core
                     hash = hash * 31 + StableStringHash(field.Name);
                     hash = hash * 31 + (int)field.TypeCode;
+                    hash = hash * 31 + field.ElementSize;
                     hash = hash * 31 + field.Size;
                     hash = hash * 31 + field.ArrayLength;
+                    hash = hash * 31 + field.Alignment;
+                    hash = hash * 31 + field.Offset.GetHashCode();
                 }
                 return hash;
             }
@@ -829,22 +901,22 @@ namespace SharedMemory
 
             foreach (var field in fields)
             {
-                if (string.IsNullOrWhiteSpace(field.Name))
-                    throw new ArgumentException("Field name cannot be empty");
+                int fieldSize = ValidateFieldDefinition(field);
 
                 if (metadata.ContainsKey(field.Name))
                     throw new ArgumentException($"Duplicate field name: {field.Name}");
 
-                long alignment = Math.Max(field.Alignment, 1);
-                currentOffset = (currentOffset + alignment - 1) & ~(alignment - 1);
+                long alignment = field.Alignment;
+                currentOffset = AlignUp(currentOffset, alignment);
 
                 var meta = new FieldMetadata
                 {
                     Name = field.Name,
                     Offset = currentOffset,
-                    Size = field.Size,
+                    Size = fieldSize,
                     ElementSize = field.ElementSize,
                     ArrayLength = field.ArrayLength,
+                    Alignment = field.Alignment,
                     TypeCode = field.TypeCode,
                     IsArray = field.ArrayLength > 1
                         && field.TypeCode != SharedTypeCode.Blob
@@ -855,10 +927,50 @@ namespace SharedMemory
                 };
 
                 metadata[field.Name] = meta;
-                currentOffset += field.Size;
+                currentOffset = checked(currentOffset + fieldSize);
             }
 
             return metadata;
+        }
+
+        private static int ValidateFieldDefinition(FieldDefinition field)
+        {
+            if (string.IsNullOrWhiteSpace(field.Name))
+                throw new ArgumentException("Field name cannot be empty");
+
+            if (field.TypeCode == SharedTypeCode.Unknown || !Enum.IsDefined(typeof(SharedTypeCode), field.TypeCode))
+                throw new ArgumentException($"Field '{field.Name}' has an invalid type code: {field.TypeCode}");
+
+            if (field.ElementSize <= 0)
+                throw new ArgumentOutOfRangeException(
+                    nameof(field.ElementSize),
+                    $"Field '{field.Name}' element size must be positive");
+
+            if (field.ArrayLength <= 0)
+                throw new ArgumentOutOfRangeException(
+                    nameof(field.ArrayLength),
+                    $"Field '{field.Name}' array length must be positive");
+
+            if (field.Alignment <= 0 || (field.Alignment & (field.Alignment - 1)) != 0)
+                throw new ArgumentException(
+                    $"Field '{field.Name}' alignment must be a positive power of 2",
+                    nameof(field.Alignment));
+
+            long size = (long)field.ElementSize * field.ArrayLength;
+            if (size > int.MaxValue)
+                throw new ArgumentOutOfRangeException(
+                    nameof(field.ArrayLength),
+                    $"Field '{field.Name}' size {size} exceeds Int32.MaxValue");
+
+            return (int)size;
+        }
+
+        private static long AlignUp(long value, long alignment)
+        {
+            checked
+            {
+                return (value + alignment - 1) & ~(alignment - 1);
+            }
         }
 
         private long CalculateTotalSize(Dictionary<string, FieldMetadata> fields)
@@ -988,8 +1100,18 @@ namespace SharedMemory
         /// </summary>
         ~StrictSharedMemory()
         {
-            _buffer?.Dispose();
-            // Don't dispose ThreadLocal in finalizer (may already be cleaned up)
+            Interlocked.Exchange(ref _disposed, 1);
+            // HighPerformanceSharedBuffer owns its unmanaged finalizer path. Avoid invoking
+            // managed Dispose logic from this finalizer.
+        }
+
+        private static void EnsureScalarField(FieldMetadata metadata)
+        {
+            if (metadata.IsArray || metadata.IsString || metadata.IsBlob || metadata.IsUtf8String)
+            {
+                throw new InvalidOperationException(
+                    $"Field '{metadata.Name}' is not a scalar field. Use the matching array, string, blob, or UTF-8 API.");
+            }
         }
 
         /// <summary>
@@ -1070,6 +1192,7 @@ namespace SharedMemory
             public int Size { get; set; }
             public int ElementSize { get; set; }
             public int ArrayLength { get; set; }
+            public int Alignment { get; set; }
             public SharedTypeCode TypeCode { get; set; }
             public bool IsArray { get; set; }
             public bool IsString { get; set; }

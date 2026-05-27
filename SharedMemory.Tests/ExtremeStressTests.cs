@@ -1084,14 +1084,12 @@ public class DataIntegrityExtremeTests
         {
             var readBuf = new byte[256];
             int received = 0;
-            int emptyReads = 0;
 
-            while (received < messageCount && emptyReads < 100000)
+            while (received < messageCount)
             {
                 var bytesRead = buffer.TryRead(readBuf);
                 if (bytesRead >= 128)
                 {
-                    emptyReads = 0;
                     int idx = BitConverter.ToInt32(readBuf, 0);
                     int checksum = BitConverter.ToInt32(readBuf, 4);
                     int expectedChecksum = idx ^ unchecked((int)0xDEADBEEF);
@@ -1116,7 +1114,6 @@ public class DataIntegrityExtremeTests
                 }
                 else
                 {
-                    emptyReads++;
                     if (producerDone && buffer.ApproximateCount == 0)
                     {
                         Thread.Sleep(1);

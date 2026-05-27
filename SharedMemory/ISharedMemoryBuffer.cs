@@ -177,6 +177,11 @@ namespace SharedMemory
         bool VerifyIntegrity();
 
         /// <summary>
+        /// Updates the stored checksum for a data region.
+        /// </summary>
+        void UpdateChecksum(long offset, int length);
+
+        /// <summary>
         /// Event raised when data is written
         /// </summary>
         event BufferEventHandler? OnDataWritten;

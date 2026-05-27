@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -30,10 +30,10 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
-  <!-- Copy IpcHelper EXE to test output directory so tests can locate it -->
+  <!-- Copy IpcHelper output to test output directory so tests can launch it via dotnet -->
   <Target Name="CopyIpcHelper" AfterTargets="Build">
     <ItemGroup>
-      <IpcHelperFiles Include="$(MSBuildThisFileDirectory)..\SharedMemory.IpcHelper\bin\$(Configuration)\net8.0-windows\*.*" />
+      <IpcHelperFiles Include="$(MSBuildThisFileDirectory)..\SharedMemory.IpcHelper\bin\$(Configuration)\net8.0\*.*" />
     </ItemGroup>
     <Copy SourceFiles="@(IpcHelperFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
   </Target>

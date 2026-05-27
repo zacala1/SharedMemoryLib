@@ -155,7 +155,7 @@ namespace SharedMemory
             _statsEnabled = enableStatistics;
             _slotCount = RoundUpToPowerOf2(slotCount);
             _slotSize = slotSize;
-            _slotTotalSize = _slotSize;
+            _slotTotalSize = RoundUpToMultiple(_slotSize, 8);
             _slotMask = _slotCount - 1;
 
             long capacity = HeaderSize + (long)_slotCount * _slotTotalSize;
@@ -262,6 +262,8 @@ namespace SharedMemory
 
             if (data.Length > MaxMessageSize)
                 throw new ArgumentException($"Data size {data.Length} exceeds max {MaxMessageSize}");
+            if (data.Length == 0)
+                throw new ArgumentException("MPMC messages must contain at least one byte", nameof(data));
 
             int spinCount = 0;
 
@@ -400,12 +402,15 @@ namespace SharedMemory
         public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
 
             while (!TryWrite(data))
             {
-                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
                     return false;
 
                 spinner.SpinOnce();
@@ -424,13 +429,16 @@ namespace SharedMemory
         public int WaitRead(Span<byte> destination, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
             int bytesRead;
 
             while ((bytesRead = TryRead(destination)) == 0)
             {
-                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
                     return 0;
 
                 spinner.SpinOnce();
@@ -504,6 +512,12 @@ namespace SharedMemory
             if (value <= 0)
                 return 1;
             return (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)value);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int RoundUpToMultiple(int value, int multiple)
+        {
+            return checked((value + multiple - 1) / multiple * multiple);
         }
     }
 }

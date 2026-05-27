@@ -29,9 +29,9 @@ namespace SharedMemory
         {
             // Writer-owned cache line (64 bytes)
             public long WritePosition;
-            public long WriterPadding1;
-            public long WriterPadding2;
-            public long WriterPadding3;
+            public long Magic;
+            public long Version;
+            public long Capacity;
             public long WriterPadding4;
             public long WriterPadding5;
             public long WriterPadding6;
@@ -49,6 +49,8 @@ namespace SharedMemory
         }
 
         private const int HeaderSize = 128;
+        private const long HeaderMagic = 0x534350534D4D4853; // "SHMMPSCS"
+        private const long HeaderVersion = 1;
         private readonly ISharedMemoryBuffer _buffer;
         private readonly long _capacity;
         private readonly long _capacityMask; // For power-of-2 optimization
@@ -133,11 +135,13 @@ namespace SharedMemory
                 _header = (Header*)_memoryHandle.Pointer;
                 _dataPtr = (byte*)_memoryHandle.Pointer + HeaderSize;
 
-                if (create)
+                if (create && _buffer.IsOwner)
                 {
-                    _header->WritePosition = 0;
-                    _header->ReadPosition = 0;
-                    Thread.MemoryBarrier();
+                    InitializeBuffer();
+                }
+                else
+                {
+                    ValidateBuffer();
                 }
             }
             catch
@@ -146,6 +150,33 @@ namespace SharedMemory
                 _buffer.Dispose();
                 throw;
             }
+        }
+
+        private void InitializeBuffer()
+        {
+            _header->WritePosition = 0;
+            _header->ReadPosition = 0;
+            _header->Version = HeaderVersion;
+            _header->Capacity = _capacity;
+            Thread.MemoryBarrier();
+            Volatile.Write(ref _header->Magic, HeaderMagic);
+        }
+
+        private void ValidateBuffer()
+        {
+            long magic = Volatile.Read(ref _header->Magic);
+            if (magic != HeaderMagic)
+                throw new InvalidOperationException("Invalid SPSC circular buffer header");
+
+            long version = Volatile.Read(ref _header->Version);
+            if (version != HeaderVersion)
+                throw new InvalidOperationException(
+                    $"SPSC circular buffer version mismatch: expected {HeaderVersion}, found {version}");
+
+            long capacity = Volatile.Read(ref _header->Capacity);
+            if (capacity != _capacity)
+                throw new InvalidOperationException(
+                    $"SPSC circular buffer capacity mismatch: expected {_capacity}, found {capacity}");
         }
 
         /// <summary>
@@ -258,12 +289,15 @@ namespace SharedMemory
         public bool WaitWrite(ReadOnlySpan<byte> data, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
 
             while (!TryWrite(data))
             {
-                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
                     return false;
 
                 spinner.SpinOnce();
@@ -283,13 +317,16 @@ namespace SharedMemory
         public int WaitRead(Span<byte> destination, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
             int bytesRead;
 
             while ((bytesRead = TryRead(destination)) == 0)
             {
-                if (cancellationToken.IsCancellationRequested || sw.Elapsed > timeout)
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
                     return 0;
 
                 spinner.SpinOnce();

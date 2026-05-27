@@ -1699,6 +1699,22 @@ public class StrictSharedMemoryTests
     }
 
     [Test]
+    public void PartialArrayWrite_ShouldClearStaleTail()
+    {
+        var schema = new TestSchema();
+        using var memory = new StrictSharedMemory<TestSchema>(TestBufferName + "_PartialArrClear", schema);
+
+        memory.WriteArray<int>(TestSchema.IntArrayField, Enumerable.Range(1, 10).ToArray());
+        memory.WriteArray<int>(TestSchema.IntArrayField, new[] { 42 });
+
+        var readArray = new int[10];
+        memory.ReadArray<int>(TestSchema.IntArrayField, readArray);
+
+        Assert.That(readArray[0], Is.EqualTo(42));
+        Assert.That(readArray.Skip(1), Is.All.EqualTo(0));
+    }
+
+    [Test]
     public void FullCapacityArray_WriteRead_ShouldWork()
     {
         var schema = new TestSchema();
@@ -1808,15 +1824,15 @@ public class StrictSharedMemoryTests
     }
 
     [Test]
-    public void WriteToArrayFieldAsScalar_ShouldWork()
+    public void WriteToArrayFieldAsScalar_ShouldThrow()
     {
-        // Writing to array field with scalar should write to first element's position
         var schema = new TestSchema();
         using var memory = new StrictSharedMemory<TestSchema>(TestBufferName + "_ArrScalar", schema);
 
-        // This should work but only writes one element
-        memory.Write(TestSchema.IntArrayField, 42);
-        Assert.That(memory.Read<int>(TestSchema.IntArrayField), Is.EqualTo(42));
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.Write(TestSchema.IntArrayField, 42));
+        Assert.Throws<InvalidOperationException>(() =>
+            memory.Read<int>(TestSchema.IntArrayField));
     }
 
     [Test]

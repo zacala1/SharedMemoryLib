@@ -5,7 +5,7 @@ using SharedMemory;
 namespace SharedMemory.Benchmark;
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class LockFreeCircularBufferBenchmark
 {
     private LockFreeCircularBuffer _buffer = null!;
@@ -72,7 +72,7 @@ public class LockFreeCircularBufferBenchmark
 }
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class LockFreeCircularBufferProducerConsumerBenchmark
 {
     private LockFreeCircularBuffer _buffer = null!;

@@ -8,7 +8,7 @@ namespace SharedMemory.Benchmark;
 /// SPSC vs MPMC 순환 버퍼 비교
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class SpscVsMpmcBenchmark
 {
     private LockFreeCircularBuffer _spsc = null!;
@@ -67,7 +67,7 @@ public class SpscVsMpmcBenchmark
 /// Lock 오버헤드 측정
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class LockOverheadBenchmark
 {
     private HighPerformanceSharedBuffer _buffer = null!;
@@ -145,7 +145,7 @@ public class LockOverheadBenchmark
 /// 데이터 크기별 처리량 (GB/s)
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class ThroughputByDataSizeBenchmark
 {
     private HighPerformanceSharedBuffer _buffer = null!;
@@ -192,7 +192,7 @@ public class ThroughputByDataSizeBenchmark
 /// SIMD 활성화 vs 비활성화
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class SimdComparisonBenchmark
 {
     private HighPerformanceSharedBuffer _simdEnabled = null!;
@@ -260,7 +260,7 @@ public class SimdComparisonBenchmark
 /// CRC32 체크섬 오버헤드
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class ChecksumOverheadBenchmark
 {
     private HighPerformanceSharedBuffer _buffer = null!;
@@ -319,7 +319,7 @@ public class ChecksumOverheadBenchmark
 /// 멀티스레드 경쟁 상황 (Contention)
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net90)]
+[SimpleJob(RuntimeMoniker.Net80)]
 public class ContentionBenchmark
 {
     private MpmcCircularBuffer _buffer = null!;
@@ -331,7 +331,7 @@ public class ContentionBenchmark
     [GlobalSetup]
     public void Setup()
     {
-        _buffer = new MpmcCircularBuffer("Bench_Contention", slotCount: 4096, slotSize: 128);
+        _buffer = new MpmcCircularBuffer("Bench_Contention", slotCount: 16384, slotSize: 128);
         _message = new byte[64];
         Random.Shared.NextBytes(_message);
     }
@@ -370,7 +370,10 @@ public class ContentionBenchmark
 
         // Fill
         for (int i = 0; i < totalMessages; i++)
-            _buffer.TryWrite(_message);
+        {
+            if (!_buffer.TryWrite(_message))
+                throw new InvalidOperationException($"Prefill failed at message {i}");
+        }
 
         int messagesPerThread = totalMessages / ThreadCount;
         Parallel.For(0, ThreadCount, _ =>

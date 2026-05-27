@@ -70,8 +70,9 @@ var options = new SharedMemoryBufferOptions
     EnableOrphanLockDetection = true, // Detect dead lock holders (default: true)
     OrphanLockTimeout = TimeSpan.FromSeconds(30), // Timeout-based fallback
     EnableEvents = false,          // OnDataWritten / OnOrphanLockDetected events
-    EnableChecksumVerification = false, // CRC32 integrity checks
+    EnableChecksumVerification = false, // Require a stored CRC32 checksum in VerifyIntegrity()
     EnableStatistics = true,       // Per-call Interlocked counters (default true; see Performance below)
+    CreateOrOpen = true,           // false = open an existing region only
     Alignment = 64,                // Cache-line alignment (default: 64)
     FilePath = null                // null = anonymous (Windows MMF / Linux /dev/shm); or path for persistent file-backed MMF
 };
@@ -90,10 +91,17 @@ if (buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)))
     try { buffer.Write(data, 0); }
     finally { buffer.ReleaseWriteLock(); }
 }
+// Release write locks on the same managed thread that acquired them.
 
-// Checksum
-buffer.UpdateChecksum(0, 100);
+// Manual checksum baseline + verification
+buffer.Write(data, 0);
+buffer.UpdateChecksum(0, data.Length);
 bool valid = buffer.VerifyIntegrity();
+
+// Open existing only
+using var reader = new HighPerformanceSharedBuffer(
+    "MyBuffer",
+    new SharedMemoryBufferOptions { Capacity = 1024 * 1024, CreateOrOpen = false });
 ```
 
 ### StrictSharedMemory (Schema-based)
@@ -161,6 +169,7 @@ buffer.WaitRead(data, TimeSpan.FromSeconds(5), cts.Token);
 // enableStatistics: track TotalWrites/Reads/Failed*/SpinExhausted* counters in the shared header
 //   - default true; set false in high-concurrency workloads where stats are tracked externally
 //     to eliminate the cross-process Interlocked contention on the counter cache lines
+// Messages must contain at least one byte; a 0-byte read means "empty/no message".
 using var buffer = new MpmcCircularBuffer(
     "MpmcQueue", slotCount: 16, slotSize: 256, maxSpins: 100, enableStatistics: true);
 
@@ -389,10 +398,10 @@ Test categories:
 | Unit / Concurrency | ~400 | Single-class functional, multi-thread, stress, boundary |
 | **Verification** | ~40 | Targeted per-change functional validation (bug fixes, optimizations, cross-platform) |
 | **Concurrency** | 6 | Recent-fix stress: opt-in stats, optimistic reader lock, orphan check under load, fairness |
-| **CrossProcess** | 6 | Spawns `SharedMemory.IpcHelper.exe` — real two-process IPC |
+| **CrossProcess** | 6 | Spawns `dotnet SharedMemory.IpcHelper.dll` — real two-process IPC |
 | Extreme | 4 | Long-running stability (explicit only) — MPMC, SPSC, Strict, 1M-message MPMC stress |
 
-> **Linux:** the test project currently targets `net8.0-windows` (legacy MMF-CrossProcess test harness). The library itself targets `net8.0` and is structurally correct for Linux runtime — add a CI job on `ubuntu-latest` and retarget the test project to validate on Linux.
+> **Linux:** the library, test project, and IPC helper now target `net8.0`. Run the same `dotnet test` command on Linux to exercise the `/dev/shm` backend.
 
 ### Coverage by Class
 
@@ -430,7 +439,7 @@ SharedMemory/                          # Core library (cross-platform: Windows +
 │                                      #   read-lock-held-while-writing now throws explicitly)
 └── SharedArray.cs                     # Generic shared T[] with indexer (Fill uses ArrayPool)
 
-SharedMemory.Tests/                    # 450 tests (NUnit)
+SharedMemory.Tests/                    # 470 tests (NUnit)
 ├── HighPerformanceSharedBufferTests.cs
 ├── LockFreeCircularBufferTests.cs
 ├── MpmcCircularBufferTests.cs
@@ -441,7 +450,7 @@ SharedMemory.Tests/                    # 450 tests (NUnit)
 ├── ConcurrencyStabilityTests.cs       # Recent-fix stress + 2 explicit long-running (SPSC + Strict)
 ├── CoverageBoostTests.cs              # Validation, reentrant locks, rare paths
 ├── ChangeVerificationTests.cs         # ~40 targeted per-change functional tests
-└── CrossProcessTests.cs               # Real IPC tests (spawns SharedMemory.IpcHelper.exe)
+└── CrossProcessTests.cs               # Real IPC tests (spawns dotnet SharedMemory.IpcHelper.dll)
 
 SharedMemory.IpcHelper/                # Child process for cross-process IPC tests
 └── Program.cs
